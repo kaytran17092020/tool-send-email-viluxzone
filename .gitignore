@@ -1,0 +1,7 @@
+node_modules
+.env
+data/*.json
+sent_history.json
+*.xlsx
+*.csv
+*.docx

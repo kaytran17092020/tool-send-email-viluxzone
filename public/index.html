@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nodemail | Email nội bộ</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <style>.source-actions{display:flex;align-items:center;gap:10px;margin-top:16px}.greeting-toggle{display:flex;align-items:center;gap:8px;margin:12px 0;font-weight:600}.greeting-toggle input{display:inline-block;width:auto;margin:0}.queue-status{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-top:16px;padding:13px 15px;border:1px solid #b9d5ff;background:#f2f7ff;border-radius:8px}.queue-status span{display:block;color:#4b617d;font-size:13px;margin-top:3px}@media(max-width:800px){.queue-status{align-items:flex-start;flex-direction:column}}</style>
+  </head>
+  <body>
+    <header>
+      <div><p class="eyebrow">VILUXZONE · EMAIL OPERATIONS</p><h1>Nodemail</h1></div>
+      <div id="connectionState" class="connection">Đang kiểm tra SMTP…</div>
+    </header>
+    <main>
+      <nav aria-label="Điều hướng chính">
+        <button class="tab active" data-view="compose">Soạn & gửi</button>
+        <button class="tab" data-view="tracking">Theo dõi khách hàng</button>
+      </nav>
+      <section id="compose" class="view active">
+        <div class="notice"><strong>Gửi Plain Text.</strong> Khách hàng luôn nhận email dạng text thường. Mỗi mail được gửi cách ngẫu nhiên 1–2 phút; có thể Pause/Resume. Nội dung HTML chỉ dùng để đối chiếu thiết kế trước khi gửi.</div>
+        <div class="grid import-grid">
+          <article class="panel">
+            <div class="panel-title"><div><p class="eyebrow">01 · RECIPIENTS</p><h2>Danh sách đã phân loại</h2></div><button id="clearRecipients" class="text-button">Xóa danh sách</button></div>
+            <div class="source-actions"><button id="importSourceButton" class="secondary" hidden>Dùng file nguồn đã cấu hình</button><span id="sourceFileName" class="hint"></span></div>
+            <label class="upload-box" for="fileInput"><input id="fileInput" type="file" accept=".xlsx,.csv" /><span>Chọn file Excel / CSV</span><small>Nhận diện các cột Email, Team, Group, Segment, Club.</small></label>
+            <div id="importMessage" class="inline-message"></div>
+            <div id="groupList" class="group-list"><p class="empty">Chưa có email. Hãy nhập file đã phân nhóm.</p></div>
+            <div class="recipient-summary" id="recipientSummary">0 người nhận được chọn</div>
+          </article>
+          <article class="panel settings-panel">
+            <p class="eyebrow">TRACKING</p><h2>Liên kết & Google Analytics</h2>
+            <dl><dt>Tracker URL</dt><dd id="trackerUrl">—</dd><dt>Google tag</dt><dd id="gaId">—</dd></dl>
+            <p class="hint">Để ghi click thật từ email, đặt <code>TRACKER_PUBLIC_URL</code> là một URL HTTPS public. Localhost chỉ dùng để thử giao diện.</p>
+          </article>
+        </div>
+        <article class="panel composer">
+          <p class="eyebrow">02 · MESSAGE</p><h2>Soạn chiến dịch</h2>
+          <div class="fields two"><label>Tiêu đề<input id="subject" maxlength="200" placeholder="Ví dụ: Ưu đãi dành riêng cho bạn" /></label><label>UTM Campaign<input id="utmCampaign" maxlength="100" placeholder="Ví dụ: september_offer" /></label></div>
+          <p class="hint">Có thể dùng biến <code>{{name}}</code>, <code>{{email}}</code>, <code>{{group}}</code>. Mọi URL https trong Text sẽ tự được thay bằng link tracking riêng.</p>
+          <label class="greeting-toggle"><input id="addGreeting" type="checkbox" checked /> Tự thêm <code>Dear {{name}},</code> cho khách có tên trong file Excel</label>
+          <div class="editor-grid">
+            <label>Text gửi khách hàng<textarea id="plainText" spellcheck="true" placeholder="Nội dung email dạng text. Dán URL đích vào đây để tự gắn tracking."></textarea></label>
+            <label>HTML để đối chiếu<textarea id="htmlPreview" class="code" spellcheck="false" placeholder="Dán HTML email để xem trước. Nội dung này không được gửi."></textarea></label>
+          </div>
+          <div class="preview-wrap"><div class="preview-title">Xem trước HTML</div><iframe id="htmlFrame" title="Xem trước HTML"></iframe></div>
+          <div class="send-row"><span id="sendHint">Chọn ít nhất một nhóm trước khi gửi.</span><button id="sendButton" class="primary">Xếp hàng gửi</button></div>
+          <div id="queueStatus" class="queue-status" aria-live="polite"></div>
+        </article>
+      </section>
+      <section id="tracking" class="view">
+        <div class="tracking-head"><div><p class="eyebrow">ACTIVITY</p><h2>Hành trình từ email đến đơn hàng</h2></div><button id="refreshDashboard" class="secondary">Làm mới</button></div>
+        <div id="metricCards" class="metric-cards"></div>
+        <article class="panel"><div class="panel-title"><h2>Khách đã tương tác</h2><label class="filter">Lọc chiến dịch <select id="campaignFilter"><option value="">Tất cả</option></select></label></div><div class="table-scroll"><table><thead><tr><th>Khách hàng</th><th>Nhóm</th><th>Chiến dịch</th><th>Trạng thái cao nhất</th><th>Lịch sử</th></tr></thead><tbody id="trackingRows"><tr><td colspan="5" class="empty">Chưa có dữ liệu theo dõi.</td></tr></tbody></table></div></article>
+        <article class="panel integration"><p class="eyebrow">STORE INTEGRATION</p><h2>Ghi nhận Add to cart, Checkout và Purchase</h2><p>Google tag <strong>G-029PNZ8EV2</strong> đo báo cáo tổng hợp. Muốn biết từng email nào đã mua, website cần gửi event về Nodemail bằng token trong <code>utm_content</code>.</p><pre id="integrationCode">Đang tải cấu hình tracker…</pre></article>
+      </section>
+    </main>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
