@@ -7,12 +7,19 @@ const express = require("express");
 const multer = require("multer");
 const nodemailer = require("nodemailer");
 const XLSX = require("xlsx");
+const { CLUB_COLLECTIONS } = require("./club-data");
+const { loadSentHistory, saveSentHistory, createHistoryIndex, inspectDuplicate, recordSent } = require("./sent-history");
 
 const app = express();
 const port = Number(process.env.PORT || 3030);
+const host = process.env.HOST || "127.0.0.1";
 const dataDirectory = path.join(__dirname, "data");
 const databaseFile = path.join(dataDirectory, "mail-data.json");
-const defaultRecipientFile = cleanText(process.env.DEFAULT_RECIPIENTS_FILE);
+const teamFilesDirectory = path.join(dataDirectory, "team-files");
+const teamContentDirectory = path.join(dataDirectory, "team-content");
+const sentHistoryFile = path.join(__dirname, "sent_history.json");
+const defaultRecipientSetting = cleanText(process.env.DEFAULT_RECIPIENTS_FILE);
+const defaultRecipientFile = defaultRecipientSetting ? path.resolve(__dirname, defaultRecipientSetting) : "";
 const sendDelayMinMs = Math.max(Number(process.env.SEND_DELAY_MIN_MS || 60_000), 60_000);
 const sendDelayMaxMs = Math.max(Number(process.env.SEND_DELAY_MAX_MS || 120_000), sendDelayMinMs);
 const duplicateWindowMs = 3 * 24 * 60 * 60 * 1000;
@@ -26,8 +33,11 @@ const upload = multer({
 });
 
 fs.mkdirSync(dataDirectory, { recursive: true });
+fs.mkdirSync(teamFilesDirectory, { recursive: true });
+fs.mkdirSync(teamContentDirectory, { recursive: true });
 const newId = (prefix) => `${prefix}_${crypto.randomBytes(10).toString("hex")}`;
 function cleanText(value) { return String(value ?? "").trim(); }
+function looksLikeDateName(value) { const text = cleanText(value); return /^(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b/.test(text); }
 function cleanSubject(value) { return cleanText(value).replace(/[\r\n]+/g, " "); }
 function isEmail(value) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanText(value)); }
 function normalizedHeader(value) { return cleanText(value).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d").replace(/[^a-z0-9]/g, ""); }
@@ -40,7 +50,7 @@ function loadDatabase() {
   try {
     const stored = JSON.parse(fs.readFileSync(databaseFile, "utf8"));
     return {
-      recipients: Array.isArray(stored.recipients) ? stored.recipients : [],
+      recipients: Array.isArray(stored.recipients) ? stored.recipients.map((recipient) => looksLikeDateName(recipient.name) ? { ...recipient, name: "" } : recipient) : [],
       campaigns: Array.isArray(stored.campaigns) ? stored.campaigns : [],
       events: Array.isArray(stored.events) ? stored.events : [],
     };
@@ -54,6 +64,41 @@ function saveDatabase() {
   const temporaryFile = `${databaseFile}.tmp`;
   fs.writeFileSync(temporaryFile, JSON.stringify(database, null, 2), "utf8");
   fs.renameSync(temporaryFile, databaseFile);
+}
+function teamFileSlug(group) {
+  return String(group || "team").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/đ/g, "d").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "team";
+}
+function defaultTeamCampaign(group) {
+  return {
+    group,
+    subject: `A fresh look for ${group} fans`,
+    plainText: `We’ve put together a fresh Viluxzone collection inspired by ${group} colours and matchday spirit.\n\nBrowse the collection here:\n{{collection_url}}\n\nThanks for being part of the Viluxzone community.\n\nBest regards,\nViluxzone Team.`,
+    htmlPreview: "",
+    collectionUrl: CLUB_COLLECTIONS[group] || "",
+    updatedAt: new Date().toISOString(),
+    isDefault: true,
+  };
+}
+function writeTeamFiles() {
+  const groups = new Map();
+  for (const recipient of database.recipients) {
+    const group = recipient.group || "Chưa phân loại";
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(recipient);
+  }
+  for (const [group, recipients] of groups) {
+    const slug = teamFileSlug(group);
+    fs.writeFileSync(path.join(teamFilesDirectory, `${slug}.json`), JSON.stringify({ group, updatedAt: new Date().toISOString(), recipients }, null, 2), "utf8");
+    const quote = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+    const csv = ["Email,Name,Team", ...recipients.map((recipient) => [recipient.email, recipient.name, group].map(quote).join(","))].join("\r\n");
+    fs.writeFileSync(path.join(teamFilesDirectory, `${slug}.csv`), `\ufeff${csv}`, "utf8");
+    const contentPath = resolveTeamContentFile(group);
+    if (!fs.existsSync(contentPath)) fs.writeFileSync(contentPath, JSON.stringify(defaultTeamCampaign(group), null, 2), "utf8");
+  }
+}
+function resolveTeamContentFile(group) { return path.join(teamContentDirectory, `${teamFileSlug(group)}.json`); }
+function loadTeamContent(group) {
+  try { return JSON.parse(fs.readFileSync(resolveTeamContentFile(group), "utf8")); } catch { return null; }
 }
 function getPublicBaseUrl(request) {
   const configured = cleanText(process.env.TRACKER_PUBLIC_URL).replace(/\/$/, "");
@@ -72,9 +117,10 @@ function addUtmParameters(rawUrl, campaign, recipient) {
 }
 function trackedUrl(rawUrl, campaign, recipient, baseUrl) { return `${baseUrl}/r/${encodeURIComponent(recipient.token)}?url=${encodeURIComponent(addUtmParameters(rawUrl, campaign, recipient))}`; }
 function replaceLinks(content, campaign, recipient, baseUrl) { return content.replace(/https?:\/\/[^\s<>\")]+/gi, (url) => trackedUrl(url, campaign, recipient, baseUrl)); }
-function personalize(content, recipient) { return content.replace(/{{\s*name\s*}}/gi, recipient.name || "").replace(/{{\s*email\s*}}/gi, recipient.email).replace(/{{\s*group\s*}}/gi, recipient.group || ""); }
+function personalize(content, recipient) { return content.replace(/{{\s*name\s*}}/gi, recipient.name || "there").replace(/{{\s*email\s*}}/gi, recipient.email).replace(/{{\s*group\s*}}/gi, recipient.group || ""); }
 function composeRecipientText(campaign, recipient) {
-  const body = personalize(campaign.plainText, recipient);
+  const withCollection = campaign.plainText.replace(/{{\s*collection_url\s*}}/gi, campaign.collectionUrl || "");
+  const body = personalize(withCollection, recipient);
   const greeting = campaign.addGreeting && recipient.name ? `Dear ${recipient.name},\n\n` : "";
   return replaceLinks(`${greeting}${body}`, campaign, recipient, campaign.trackerBaseUrl);
 }
@@ -100,6 +146,10 @@ function campaignSummary(campaign) {
   return {
     id: campaign.id, subject: campaign.subject, createdAt: campaign.createdAt, status: campaign.status || "completed", nextSendAt: campaign.nextSendAt || null, completedAt: campaign.completedAt || null,
     total: campaign.recipients.length, queued: count("queued"), sending: count("sending"), sent: count("sent"), failed: count("failed"), blocked: count("blocked"),
+    progressPercent: campaign.recipients.length ? Math.round((count("sent") + count("failed") + count("blocked")) * 100 / campaign.recipients.length) : 100,
+    currentEmail: campaign.recipients.find((recipient) => recipient.status === "sending")?.email || "",
+    lastSentEmail: campaign.recipients.filter((recipient) => recipient.status === "sent").sort((a, b) => Date.parse(b.sentAt || 0) - Date.parse(a.sentAt || 0))[0]?.email || "",
+    lastSentAt: campaign.recipients.filter((recipient) => recipient.status === "sent").sort((a, b) => Date.parse(b.sentAt || 0) - Date.parse(a.sentAt || 0))[0]?.sentAt || null,
     clicked: uniqueByEvent("click"), addedToCart: uniqueByEvent("add_to_cart"), checkout: uniqueByEvent("begin_checkout"), purchased: uniqueByEvent("purchase"),
   };
 }
@@ -141,6 +191,14 @@ async function runQueue() {
     });
     recipient.status = "sent";
     recipient.sentAt = new Date().toISOString();
+    try {
+      const history = loadSentHistory(sentHistoryFile);
+      recordSent(history, { email: recipient.email, club: recipient.group, subject: personalize(campaign.subject, recipient), body: composeRecipientText(campaign, recipient), sentAt: recipient.sentAt, funnel: campaign.funnel || campaign.type || "" });
+      saveSentHistory(sentHistoryFile, history);
+    } catch (historyError) {
+      recipient.historyError = `Email đã gửi; ghi sent_history thất bại: ${historyError.message}`;
+      console.error(recipient.historyError);
+    }
   } catch (error) {
     recipient.status = "failed";
     recipient.error = error.message;
@@ -156,7 +214,7 @@ async function runQueue() {
   else scheduleWorker(0);
 }
 
-function parseRecipientWorkbook(buffer) {
+function parseRecipientWorkbook(buffer, forcedGroup = "") {
   let workbook;
   try { workbook = XLSX.read(buffer, { type: "buffer", raw: false }); } catch { throw new Error("Không thể đọc file bảng tính này."); }
   const imported = [], invalidRows = [], existing = new Set(database.recipients.map((recipient) => recipient.email.toLowerCase()));
@@ -167,19 +225,20 @@ function parseRecipientWorkbook(buffer) {
     const emailColumn = columnByPriority(headers, ["email", "mail", "emailaddress"]);
     if (!emailColumn) continue;
     const groupColumn = columnByPriority(headers, ["team", "group", "segment", "club", "doi", "nhom", "category"]);
-    const nameColumn = columnByPriority(headers, ["name", "fullname", "customer", "first", "ten"]);
+    const nameColumn = headers.find((header) => ["name", "fullname", "customername", "firstname", "customerfirst", "customerfirstname", "ten", "tenkhachhang"].includes(normalizedHeader(header)));
     rows.forEach((row, index) => {
       const email = cleanText(row[emailColumn]).toLowerCase();
       if (!email) return;
       if (!isEmail(email)) { invalidRows.push({ sheet: sheetName, row: index + 2 }); return; }
       if (existing.has(email)) return;
       existing.add(email);
-      imported.push({ id: newId("recipient"), email, name: nameColumn ? cleanText(row[nameColumn]) : "", group: groupColumn ? cleanText(row[groupColumn]) || "Chưa phân loại" : sheetName, sourceSheet: sheetName, createdAt: new Date().toISOString() });
+      imported.push({ id: newId("recipient"), email, name: nameColumn ? cleanText(row[nameColumn]) : "", group: forcedGroup || (groupColumn ? cleanText(row[groupColumn]) || "Chưa phân loại" : sheetName), sourceSheet: sheetName, createdAt: new Date().toISOString() });
     });
   }
   if (!imported.length) throw new Error("Không tìm thấy email mới. Cần cột Email, Team/Group hoặc Segment.");
   database.recipients.push(...imported);
   saveDatabase();
+  writeTeamFiles();
   return { imported: imported.length, skippedInvalid: invalidRows.length, recipients: recipientPayload() };
 }
 
@@ -188,27 +247,119 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, "public")));
 app.get("/api/settings", (request, response) => response.json({
   trackerBaseUrl: getPublicBaseUrl(request), trackerIsPublic: Boolean(process.env.TRACKER_PUBLIC_URL), googleMeasurementId: process.env.GA4_MEASUREMENT_ID || "G-029PNZ8EV2",
-  smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS), from: process.env.SMTP_FROM || process.env.SMTP_USER || "",
+  smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && !/your-domain|replace-with/i.test(`${process.env.SMTP_USER} ${process.env.SMTP_PASS}`)), from: process.env.SMTP_FROM || process.env.SMTP_USER || "",
   defaultRecipientFileConfigured: Boolean(defaultRecipientFile), defaultRecipientFileName: defaultRecipientFile ? path.basename(defaultRecipientFile) : "", delayMinMinutes: sendDelayMinMs / 60_000, delayMaxMinutes: sendDelayMaxMs / 60_000,
 }));
 app.post("/api/recipients/import", upload.single("file"), (request, response) => {
   if (!request.file) return response.status(400).json({ error: "Chọn file danh sách email trước khi nhập." });
-  try { response.json(parseRecipientWorkbook(request.file.buffer)); } catch (error) { response.status(400).json({ error: error.message }); }
+  try { response.json(parseRecipientWorkbook(request.file.buffer, cleanText(request.query.group))); } catch (error) { response.status(400).json({ error: error.message }); }
 });
 app.post("/api/recipients/import-source", (_request, response) => {
   if (!defaultRecipientFile) return response.status(400).json({ error: "Chưa cấu hình DEFAULT_RECIPIENTS_FILE trong file .env." });
   try { response.json(parseRecipientWorkbook(fs.readFileSync(defaultRecipientFile))); } catch (error) { response.status(400).json({ error: `Không thể nhập file nguồn: ${error.message}` }); }
 });
 app.get("/api/recipients", (_request, response) => response.json(recipientPayload()));
-app.delete("/api/recipients", (_request, response) => { database.recipients = []; saveDatabase(); response.status(204).end(); });
+app.delete("/api/recipients", (_request, response) => { database.recipients = []; saveDatabase(); writeTeamFiles(); response.status(204).end(); });
+app.get("/api/club-collections", (_request, response) => response.json(CLUB_COLLECTIONS));
+app.get("/api/teams", (_request, response) => {
+  const groups = recipientPayload().groups;
+  const history = loadSentHistory(sentHistoryFile);
+  response.json(Object.entries(groups).sort((a, b) => a[0].localeCompare(b[0], "vi")).map(([group, count]) => ({ group, count, collectionUrl: CLUB_COLLECTIONS[group] || "", contentSaved: Boolean(loadTeamContent(group)), historyCount: Object.values(history).filter((entry) => entry?.club === group).length, fileName: `${teamFileSlug(group)}.csv` })));
+});
+app.get("/api/team-content", (request, response) => {
+  const group = cleanText(request.query.group);
+  if (!group || group.length > 100) return response.status(400).json({ error: "Chọn một đội hợp lệ." });
+  response.json(loadTeamContent(group) || { group, subject: "", plainText: "", htmlPreview: "", collectionUrl: CLUB_COLLECTIONS[group] || "" });
+});
+app.put("/api/team-content", (request, response) => {
+  const group = cleanText(request.body.group);
+  if (!group || group.length > 100) return response.status(400).json({ error: "Chọn một đội hợp lệ." });
+  const rawCollectionUrl = cleanText(request.body.collectionUrl), collectionUrl = rawCollectionUrl ? safeDestination(rawCollectionUrl) : "";
+  if (rawCollectionUrl && !collectionUrl) return response.status(400).json({ error: "Collection URL cần là liên kết http/https hợp lệ." });
+  const content = {
+    group,
+    subject: cleanSubject(request.body.subject).slice(0, 200),
+    plainText: String(request.body.plainText ?? "").slice(0, 100_000),
+    htmlPreview: String(request.body.htmlPreview ?? "").slice(0, 100_000),
+    collectionUrl,
+    updatedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(resolveTeamContentFile(group), JSON.stringify(content, null, 2), "utf8");
+  response.json({ ok: true, group: content.group, updatedAt: content.updatedAt });
+});
+app.get("/api/teams/export", (request, response) => {
+  const group = cleanText(request.query.group);
+  if (!group) return response.status(400).send("Chọn đội cần xuất.");
+  const rows = database.recipients.filter((recipient) => recipient.group === group);
+  if (!rows.length) return response.status(404).send("Đội này chưa có email.");
+  const quote = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+  const csv = ["Email,Name,Team", ...rows.map((recipient) => [recipient.email, recipient.name, recipient.group].map(quote).join(","))].join("\r\n");
+  response.setHeader("Content-Type", "text/csv; charset=utf-8");
+  response.setHeader("Content-Disposition", `attachment; filename="${teamFileSlug(group)}.csv"`);
+  response.send(`\ufeff${csv}`);
+});
+
+function campaignRequestedRecipients(body, persistManual = false) {
+  const selectedGroups = Array.isArray(body.groups) ? body.groups.map(cleanText).filter(Boolean) : [];
+  if (selectedGroups.length > 1) throw new Error("Gửi từng đội một để dùng đúng nội dung riêng của từng đội.");
+  let requested = database.recipients.filter((recipient) => selectedGroups.includes(recipient.group));
+  const rawManual = String(body.manualEmails ?? "").split(/[\r\n,;\t ]+/).map((email) => email.trim().toLowerCase()).filter(Boolean);
+  const invalidManual = rawManual.filter((email) => !isEmail(email));
+  if (invalidManual.length) throw new Error(`Có ${invalidManual.length} địa chỉ email nhập tay không hợp lệ.`);
+  const uniqueManual = [...new Set(rawManual)];
+  for (const email of uniqueManual) {
+    const existsInRequested = requested.some((recipient) => recipient.email.toLowerCase() === email);
+    if (existsInRequested) continue;
+    let existing = database.recipients.find((recipient) => recipient.email.toLowerCase() === email);
+    if (!existing) {
+      existing = { id: newId("recipient"), email, name: "", group: selectedGroups[0] || "Danh sách nhập tay", sourceSheet: "manual", createdAt: new Date().toISOString() };
+      if (persistManual) database.recipients.push(existing);
+    }
+    requested.push(existing);
+  }
+  const deduped = [...new Map(requested.map((recipient) => [recipient.email.toLowerCase(), recipient])).values()];
+  return { requested: deduped, selectedGroups, manualCount: uniqueManual.length };
+}
+function inspectCampaignDuplicates(body, recipients) {
+  const history = createHistoryIndex(loadSentHistory(sentHistoryFile));
+  const collectionUrl = safeDestination(cleanText(body.collectionUrl)) || "";
+  return recipients.map((recipient) => {
+    const campaign = { plainText: String(body.plainText ?? "").replace(/{{\s*collection_url\s*}}/gi, collectionUrl), addGreeting: body.addGreeting !== false, trackerBaseUrl: "", utmCampaign: "" };
+    const finalBody = personalize(campaign.plainText, recipient);
+    const greeting = campaign.addGreeting && recipient.name ? `Dear ${recipient.name},\n\n` : "";
+    const result = inspectDuplicate(history, recipient.email, personalize(cleanSubject(body.subject), recipient), `${greeting}${finalBody}`);
+    result.recentCampaign = isRecentlySentSameContent(recipient.email, contentFingerprint(cleanSubject(body.subject), String(body.plainText ?? "").replace(/{{\s*collection_url\s*}}/gi, collectionUrl)));
+    result.isDuplicate = result.isDuplicate || result.recentCampaign;
+    return { email: recipient.email, group: recipient.group, ...result };
+  });
+}
+app.post("/api/campaigns/preview", (request, response) => {
+  const subject = cleanSubject(request.body.subject), plainText = cleanText(request.body.plainText);
+  if (!subject || !plainText) return response.status(400).json({ error: "Cần có tiêu đề và nội dung Text." });
+  const rawCollectionUrl = cleanText(request.body.collectionUrl), collectionUrl = rawCollectionUrl ? safeDestination(rawCollectionUrl) : "";
+  if (rawCollectionUrl && !collectionUrl) return response.status(400).json({ error: "Collection URL cần là liên kết http/https hợp lệ." });
+  if (/{{\s*collection_url\s*}}/i.test(plainText) && !collectionUrl) return response.status(400).json({ error: "Nội dung đang có {{collection_url}} nhưng chưa chọn/dán Collection URL." });
+  let audience;
+  try { audience = campaignRequestedRecipients(request.body, false); } catch (error) { return response.status(400).json({ error: error.message }); }
+  const duplicates = inspectCampaignDuplicates(request.body, audience.requested).filter((item) => item.isDuplicate);
+  response.json({ total: audience.requested.length, manualCount: audience.manualCount, duplicateCount: duplicates.length, duplicates: duplicates.slice(0, 100), duplicateHistory: "Lịch sử cũ được so email + tiêu đề; các lượt gửi mới được so cả nội dung chuẩn hóa." });
+});
 
 app.post("/api/campaigns/send", async (request, response) => {
   const subject = cleanSubject(request.body.subject), plainText = cleanText(request.body.plainText);
-  const selectedGroups = Array.isArray(request.body.groups) ? request.body.groups.map(cleanText) : [];
   if (!subject || !plainText) return response.status(400).json({ error: "Cần có tiêu đề và nội dung Text." });
   if (database.campaigns.some((campaign) => ["running", "paused"].includes(campaign.status))) return response.status(409).json({ error: "Đang có một chiến dịch chưa hoàn tất. Hãy Pause/Resume hoặc chờ chiến dịch đó gửi xong." });
-  const requested = database.recipients.filter((recipient) => selectedGroups.includes(recipient.group));
+  let audience;
+  try { audience = campaignRequestedRecipients(request.body, true); } catch (error) { return response.status(400).json({ error: error.message }); }
+  const { requested, selectedGroups } = audience;
   if (!requested.length) return response.status(400).json({ error: "Chưa chọn đội hoặc nhóm email." });
+  const collectionUrl = safeDestination(cleanText(request.body.collectionUrl)) || "";
+  if (cleanText(request.body.collectionUrl) && !collectionUrl) return response.status(400).json({ error: "Collection URL cần là liên kết http/https hợp lệ." });
+  if (/{{\s*collection_url\s*}}/i.test(plainText) && !collectionUrl) return response.status(400).json({ error: "Nội dung đang có {{collection_url}} nhưng chưa chọn/dán Collection URL." });
+  const duplicateChecks = inspectCampaignDuplicates(request.body, requested);
+  const duplicatesByEmail = new Map(duplicateChecks.filter((item) => item.isDuplicate).map((item) => [item.email.toLowerCase(), item]));
+  saveDatabase();
+  writeTeamFiles();
   try { const transporter = getTransporter(); await transporter.verify(); } catch (error) { return response.status(400).json({ error: `SMTP chưa sẵn sàng: ${error.message}` }); }
   const fingerprint = contentFingerprint(subject, plainText);
   const seenInCycle = new Set();
@@ -216,11 +367,17 @@ app.post("/api/campaigns/send", async (request, response) => {
     const base = { recipientId: recipient.id, email: recipient.email, name: recipient.name, group: recipient.group, token: newId("mail"), status: "queued", sentAt: null, error: null };
     if (seenInCycle.has(recipient.email)) return { ...base, status: "blocked", blockedReason: "Trùng email trong vòng gửi hiện tại" };
     seenInCycle.add(recipient.email);
-    if (isRecentlySentSameContent(recipient.email, fingerprint)) return { ...base, status: "blocked", blockedReason: "Đã nhận cùng nội dung trong 3 ngày gần nhất" };
+    const historyDuplicate = duplicatesByEmail.get(recipient.email.toLowerCase());
+    if (historyDuplicate && request.body.allowDuplicates !== true) {
+      const reasons = [historyDuplicate.sameSubject && "đã nhận cùng tiêu đề", historyDuplicate.sameContent && "đã nhận cùng nội dung"].filter(Boolean).join(" và ");
+      return { ...base, status: "blocked", blockedReason: `sent_history.json: ${reasons || "trùng lịch sử"}` };
+    }
+    if (isRecentlySentSameContent(recipient.email, fingerprint) && request.body.allowDuplicates !== true) return { ...base, status: "blocked", blockedReason: "Đã nhận cùng nội dung trong 3 ngày gần nhất" };
     return base;
   });
   const campaign = {
     id: newId("campaign"), createdAt: new Date().toISOString(), subject, plainText, htmlPreview: cleanText(request.body.htmlPreview), contentHash: fingerprint,
+    group: selectedGroups[0] || "Danh sách nhập tay", collectionUrl, funnel: cleanText(request.body.funnel), type: cleanText(request.body.type),
     utmCampaign: cleanText(request.body.utmCampaign) || `email_${Date.now()}`, trackerBaseUrl: getPublicBaseUrl(request), addGreeting: request.body.addGreeting !== false, recipients, status: "running", nextSendAt: null, completedAt: null,
   };
   finishCampaignIfDone(campaign);
@@ -267,4 +424,5 @@ app.post("/event/:token", (request, response) => {
   database.events.push({ id: newId("event"), campaignId: campaign.id, token: request.params.token, type, createdAt: new Date().toISOString(), value: Number(request.body.value || 0) || undefined }); saveDatabase(); response.status(201).json({ ok: true });
 });
 app.use((error, _request, response, _next) => { console.error(error); response.status(400).json({ error: error.message || "Yêu cầu không hợp lệ." }); });
-app.listen(port, () => { console.log(`Nodemail đang chạy tại http://localhost:${port}`); if (database.campaigns.some((campaign) => campaign.status === "running")) scheduleWorker(0); });
+writeTeamFiles();
+app.listen(port, host, () => { console.log(`Nodemail đang chạy tại http://127.0.0.1:${port}`); if (database.campaigns.some((campaign) => campaign.status === "running")) scheduleWorker(0); });

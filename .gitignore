@@ -1,6 +1,8 @@
 node_modules
 .env
 data/*.json
+data/team-files/
+data/team-content/
 sent_history.json
 *.xlsx
 *.csv

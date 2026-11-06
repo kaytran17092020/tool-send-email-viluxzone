@@ -1,12 +1,12 @@
 {
   "name": "send-mail",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Giao diện local để phân nhóm khách hàng và quản lý email marketing của Viluxzone",
+  "main": "indexAI.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js",
-    "test": "node --check index.js && node --check public/app.js"
+    "start": "node indexAI.js",
+    "dev": "node --watch indexAI.js",
+    "test": "node --check indexAI.js && node --check index.js && node --check sent-history.js && node --check public/app.js"
   },
   "author": "",
   "license": "ISC",
