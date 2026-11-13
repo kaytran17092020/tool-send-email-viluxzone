@@ -8,12 +8,17 @@ const multer = require("multer");
 const nodemailer = require("nodemailer");
 const XLSX = require("xlsx");
 const { CLUB_COLLECTIONS } = require("./club-data");
-const { loadSentHistory, saveSentHistory, createHistoryIndex, inspectDuplicate, recordSent } = require("./sent-history");
+const historyFiles = require("./sent-history");
+const { createHistoryIndex, inspectDuplicate, recordSent } = historyFiles;
+const cloud = require("./cloud-store");
+const smtpSettings = require("./smtp-settings");
+function loadSentHistory(file) { return cloud.current()?.history || historyFiles.loadSentHistory(file); }
+function saveSentHistory(file, history) { if (cloud.current()) { cloud.current().history = history; cloud.dirty(); } else historyFiles.saveSentHistory(file, history); }
 
 const app = express();
 const port = Number(process.env.PORT || 3030);
 const host = process.env.HOST || "127.0.0.1";
-const dataDirectory = path.join(__dirname, "data");
+const dataDirectory = process.env.VERCEL ? "/tmp/nodemail" : path.join(__dirname, "data");
 const databaseFile = path.join(dataDirectory, "mail-data.json");
 const teamFilesDirectory = path.join(dataDirectory, "team-files");
 const teamContentDirectory = path.join(dataDirectory, "team-content");
@@ -59,8 +64,13 @@ function loadDatabase() {
     return { recipients: [], campaigns: [], events: [] };
   }
 }
-let database = loadDatabase();
+const localDatabase = loadDatabase();
+const database = new Proxy(localDatabase, {
+  get(target, key) { return (cloud.current()?.data || target)[key]; },
+  set(target, key, value) { (cloud.current()?.data || target)[key] = value; return true; },
+});
 function saveDatabase() {
+  if (cloud.current()) { cloud.dirty(); return; }
   const temporaryFile = `${databaseFile}.tmp`;
   fs.writeFileSync(temporaryFile, JSON.stringify(database, null, 2), "utf8");
   fs.renameSync(temporaryFile, databaseFile);
@@ -72,14 +82,15 @@ function defaultTeamCampaign(group) {
   return {
     group,
     subject: `A fresh look for ${group} fans`,
-    plainText: `We’ve put together a fresh Viluxzone collection inspired by ${group} colours and matchday spirit.\n\nBrowse the collection here:\n{{collection_url}}\n\nThanks for being part of the Viluxzone community.\n\nBest regards,\nViluxzone Team.`,
-    htmlPreview: "",
+    plainText: "",
+    htmlBody: "",
     collectionUrl: CLUB_COLLECTIONS[group] || "",
     updatedAt: new Date().toISOString(),
     isDefault: true,
   };
 }
 function writeTeamFiles() {
+  if (cloud.current()) return;
   const groups = new Map();
   for (const recipient of database.recipients) {
     const group = recipient.group || "Chưa phân loại";
@@ -98,6 +109,7 @@ function writeTeamFiles() {
 }
 function resolveTeamContentFile(group) { return path.join(teamContentDirectory, `${teamFileSlug(group)}.json`); }
 function loadTeamContent(group) {
+  if (cloud.current()) return cloud.current().teamContent[teamFileSlug(group)] || null;
   try { return JSON.parse(fs.readFileSync(resolveTeamContentFile(group), "utf8")); } catch { return null; }
 }
 function getPublicBaseUrl(request) {
@@ -118,6 +130,30 @@ function addUtmParameters(rawUrl, campaign, recipient) {
 function trackedUrl(rawUrl, campaign, recipient, baseUrl) { return `${baseUrl}/r/${encodeURIComponent(recipient.token)}?url=${encodeURIComponent(addUtmParameters(rawUrl, campaign, recipient))}`; }
 function replaceLinks(content, campaign, recipient, baseUrl) { return content.replace(/https?:\/\/[^\s<>\")]+/gi, (url) => trackedUrl(url, campaign, recipient, baseUrl)); }
 function personalize(content, recipient) { return content.replace(/{{\s*name\s*}}/gi, recipient.name || "there").replace(/{{\s*email\s*}}/gi, recipient.email).replace(/{{\s*group\s*}}/gi, recipient.group || ""); }
+function escapeHtml(value) { return String(value ?? "").replace(/[&<>\"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[character]); }
+function htmlToText(html) {
+  return String(html ?? "").replace(/<!--[\s\S]*?-->/g, " ").replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<\/(p|div|h[1-6]|li|tr|blockquote)\s*>/gi, "\n\n").replace(/<br\s*\/?\s*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '\"').replace(/&#39;|&apos;/gi, "'").replace(/&#(\d+);/g, (match, code) => { const value = Number(code); return value <= 0x10ffff ? String.fromCodePoint(value) : match; })
+    .replace(/[ \t]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function campaignPlainText(body) { return cleanText(body.plainText) || htmlToText(body.htmlBody || body.htmlPreview || ""); }
+function personalizeHtml(content, campaign, recipient) {
+  let html = String(content || "").slice(0, 500_000)
+    .replace(/<\s*(script|iframe|object|embed)\b[^>]*>[\s\S]*?<\/\s*\1\s*>/gi, "")
+    .replace(/\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+    .replace(/(href|src)\s*=\s*(["'])\s*javascript:[\s\S]*?\2/gi, '$1="#"');
+  html = html.replace(/{{\s*collection_url\s*}}/gi, escapeHtml(campaign.collectionUrl || ""))
+    .replace(/{{\s*name\s*}}/gi, escapeHtml(recipient.name || "there"))
+    .replace(/{{\s*email\s*}}/gi, escapeHtml(recipient.email))
+    .replace(/{{\s*group\s*}}/gi, escapeHtml(recipient.group || ""));
+  return html.replace(/<a\b([^>]*?)\bhref\s*=\s*(["'])(.*?)\2([^>]*)>/gi, (match, before, quote, encodedUrl, after) => {
+    const destination = safeDestination(encodedUrl.replace(/&amp;/gi, "&").replace(/&#0*38;/gi, "&"));
+    if (!destination) return match;
+    return `<a${before}href=${quote}${escapeHtml(trackedUrl(destination, campaign, recipient, campaign.trackerBaseUrl))}${quote}${after}>`;
+  });
+}
 function composeRecipientText(campaign, recipient) {
   const withCollection = campaign.plainText.replace(/{{\s*collection_url\s*}}/gi, campaign.collectionUrl || "");
   const body = personalize(withCollection, recipient);
@@ -125,10 +161,14 @@ function composeRecipientText(campaign, recipient) {
   return replaceLinks(`${greeting}${body}`, campaign, recipient, campaign.trackerBaseUrl);
 }
 function safeDestination(value) { try { const url = new URL(value); return ["http:", "https:"].includes(url.protocol) ? url.toString() : null; } catch { return null; } }
-function getTransporter() {
-  const host = cleanText(process.env.SMTP_HOST), user = cleanText(process.env.SMTP_USER), password = cleanText(process.env.SMTP_PASS);
+function getSmtpConfig(encrypted) { return smtpSettings.decrypt(encrypted || cloud.current()?.smtp) || smtpSettings.environment(); }
+function getTransporter(encrypted) {
+  const config = getSmtpConfig(encrypted);
+  const host = cleanText(config.host), user = cleanText(config.user), password = config.password;
   if (!host || !user || !password) throw new Error("Thiếu SMTP_HOST, SMTP_USER hoặc SMTP_PASS trong file .env.");
-  return nodemailer.createTransport({ host, port: Number(process.env.SMTP_PORT || 465), secure: cleanText(process.env.SMTP_SECURE || "true").toLowerCase() !== "false", auth: { user, pass: password } });
+  if (/your-domain|replace-with/i.test(`${user} ${password}`)) throw new Error("SMTP vẫn dùng thông tin mẫu. Hãy điền biến môi trường SMTP hợp lệ.");
+  return nodemailer.createTransport({ host, port: config.port, secure: config.secure, requireTLS: !config.secure,
+    from: config.from || user, connectionTimeout: 15000, greetingTimeout: 15000, socketTimeout: 25000, auth: { user, pass: password } });
 }
 function recipientPayload() {
   const groups = {};
@@ -159,6 +199,7 @@ let workerTimer = null;
 let workerBusy = false;
 function clearWorkerTimer() { if (workerTimer) clearTimeout(workerTimer); workerTimer = null; }
 function scheduleWorker(delayMs = 0) {
+  if (cloud.enabled) { cloud.schedule(delayMs); return; }
   clearWorkerTimer();
   workerTimer = setTimeout(() => { workerTimer = null; runQueue().catch((error) => console.error("Queue error:", error)); }, Math.max(delayMs, 0));
 }
@@ -188,6 +229,7 @@ async function runQueue() {
       to: recipient.email,
       subject: personalize(campaign.subject, recipient),
       text: composeRecipientText(campaign, recipient),
+      ...(campaign.htmlBody ? { html: personalizeHtml(campaign.htmlBody, campaign, recipient) } : {}),
     });
     recipient.status = "sent";
     recipient.sentAt = new Date().toISOString();
@@ -245,9 +287,42 @@ function parseRecipientWorkbook(buffer, forcedGroup = "") {
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, "public")));
+if (cloud.enabled) app.use(cloud.middleware);
+app.get("/api/health", async (request, response) => {
+  if (cloud.enabled && request.query.probe === "true") await cloud.probe();
+  const queueProbe = cloud.enabled && request.query.queue === "true" ? await cloud.queueProbe(request.query.wake === "true") : null;
+  if (request.query.smtp === "true") {
+    try { await getTransporter().verify(); }
+    catch (error) { return response.status(503).json({ ok: false, storage: "connected", smtp: "unavailable", code: error.code || "SMTP_ERROR" }); }
+  }
+  response.json({ ok: true, storage: cloud.enabled ? "private-blob" : "local", smtp: request.query.smtp === "true" ? "verified" : "not-tested", queueProbe });
+});
+app.get("/api/smtp-settings", (_request, response) => {
+  const config = getSmtpConfig();
+  response.set("Cache-Control", "no-store").json({ host: config.host, port: config.port, secure: config.secure,
+    user: /your-domain/.test(config.user) ? "" : config.user, from: /your-domain/.test(config.from) ? "" : config.from,
+    passwordSaved: smtpSettings.configured(config), editable: cloud.enabled });
+});
+app.put("/api/smtp-settings", (request, response) => {
+  if (!cloud.current()) return response.status(400).json({ error: "Bản local dùng file .env." });
+  if (database.campaigns.some((campaign) => campaign.status === "running")) return response.status(409).json({ error: "Pause chiến dịch trước khi đổi SMTP." });
+  const previous = getSmtpConfig();
+  const config = { host: cleanText(request.body.host), port: Number(request.body.port), secure: request.body.secure === true,
+    user: cleanText(request.body.user), password: String(request.body.password || "") || (previous.user === cleanText(request.body.user) ? previous.password : ""),
+    from: cleanText(request.body.from) || cleanText(request.body.user) };
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(config.host) || ![465, 587].includes(config.port) || !isEmail(config.user) || !smtpSettings.configured(config)
+      || config.password.length > 4096 || /[\r\n]/.test(config.from)) return response.status(400).json({ error: "Điền host, cổng 465/587, email và mật khẩu SMTP hợp lệ." });
+  cloud.current().smtp = smtpSettings.encrypt(config);
+  cloud.dirty();
+  response.json({ ok: true });
+});
+app.post("/api/smtp-verify", async (_request, response) => {
+  try { await getTransporter().verify(); response.json({ ok: true, message: "Kết nối SMTP thành công. Chưa gửi email." }); }
+  catch (error) { response.status(400).json({ error: `Không kết nối được SMTP (${error.code || "CONFIG_ERROR"}). Kiểm tra host, email và mật khẩu hộp thư.` }); }
+});
 app.get("/api/settings", (request, response) => response.json({
-  trackerBaseUrl: getPublicBaseUrl(request), trackerIsPublic: Boolean(process.env.TRACKER_PUBLIC_URL), googleMeasurementId: process.env.GA4_MEASUREMENT_ID || "G-029PNZ8EV2",
-  smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && !/your-domain|replace-with/i.test(`${process.env.SMTP_USER} ${process.env.SMTP_PASS}`)), from: process.env.SMTP_FROM || process.env.SMTP_USER || "",
+  trackerBaseUrl: getPublicBaseUrl(request), trackerIsPublic: Boolean(process.env.TRACKER_PUBLIC_URL) && (!cloud.enabled || process.env.TRACKER_PUBLIC_ACCESS === "true"), googleMeasurementId: process.env.GA4_MEASUREMENT_ID || "G-029PNZ8EV2",
+  smtpConfigured: smtpSettings.configured(getSmtpConfig()), from: getSmtpConfig().from,
   defaultRecipientFileConfigured: Boolean(defaultRecipientFile), defaultRecipientFileName: defaultRecipientFile ? path.basename(defaultRecipientFile) : "", delayMinMinutes: sendDelayMinMs / 60_000, delayMaxMinutes: sendDelayMaxMs / 60_000,
 }));
 app.post("/api/recipients/import", upload.single("file"), (request, response) => {
@@ -269,7 +344,7 @@ app.get("/api/teams", (_request, response) => {
 app.get("/api/team-content", (request, response) => {
   const group = cleanText(request.query.group);
   if (!group || group.length > 100) return response.status(400).json({ error: "Chọn một đội hợp lệ." });
-  response.json(loadTeamContent(group) || { group, subject: "", plainText: "", htmlPreview: "", collectionUrl: CLUB_COLLECTIONS[group] || "" });
+  response.json(loadTeamContent(group) || { group, subject: "", plainText: "", htmlBody: "", collectionUrl: CLUB_COLLECTIONS[group] || "" });
 });
 app.put("/api/team-content", (request, response) => {
   const group = cleanText(request.body.group);
@@ -280,11 +355,12 @@ app.put("/api/team-content", (request, response) => {
     group,
     subject: cleanSubject(request.body.subject).slice(0, 200),
     plainText: String(request.body.plainText ?? "").slice(0, 100_000),
-    htmlPreview: String(request.body.htmlPreview ?? "").slice(0, 100_000),
+    htmlBody: String(request.body.htmlBody ?? request.body.htmlPreview ?? "").slice(0, 500_000),
     collectionUrl,
     updatedAt: new Date().toISOString(),
   };
-  fs.writeFileSync(resolveTeamContentFile(group), JSON.stringify(content, null, 2), "utf8");
+  if (cloud.current()) { cloud.current().teamContent[teamFileSlug(group)] = content; cloud.dirty(); }
+  else fs.writeFileSync(resolveTeamContentFile(group), JSON.stringify(content, null, 2), "utf8");
   response.json({ ok: true, group: content.group, updatedAt: content.updatedAt });
 });
 app.get("/api/teams/export", (request, response) => {
@@ -324,21 +400,21 @@ function inspectCampaignDuplicates(body, recipients) {
   const history = createHistoryIndex(loadSentHistory(sentHistoryFile));
   const collectionUrl = safeDestination(cleanText(body.collectionUrl)) || "";
   return recipients.map((recipient) => {
-    const campaign = { plainText: String(body.plainText ?? "").replace(/{{\s*collection_url\s*}}/gi, collectionUrl), addGreeting: body.addGreeting !== false, trackerBaseUrl: "", utmCampaign: "" };
+    const campaign = { plainText: campaignPlainText(body).replace(/{{\s*collection_url\s*}}/gi, collectionUrl), addGreeting: body.addGreeting !== false, trackerBaseUrl: "", utmCampaign: "" };
     const finalBody = personalize(campaign.plainText, recipient);
     const greeting = campaign.addGreeting && recipient.name ? `Dear ${recipient.name},\n\n` : "";
     const result = inspectDuplicate(history, recipient.email, personalize(cleanSubject(body.subject), recipient), `${greeting}${finalBody}`);
-    result.recentCampaign = isRecentlySentSameContent(recipient.email, contentFingerprint(cleanSubject(body.subject), String(body.plainText ?? "").replace(/{{\s*collection_url\s*}}/gi, collectionUrl)));
+    result.recentCampaign = isRecentlySentSameContent(recipient.email, contentFingerprint(cleanSubject(body.subject), campaign.plainText));
     result.isDuplicate = result.isDuplicate || result.recentCampaign;
     return { email: recipient.email, group: recipient.group, ...result };
   });
 }
 app.post("/api/campaigns/preview", (request, response) => {
-  const subject = cleanSubject(request.body.subject), plainText = cleanText(request.body.plainText);
-  if (!subject || !plainText) return response.status(400).json({ error: "Cần có tiêu đề và nội dung Text." });
+  const subject = cleanSubject(request.body.subject), plainText = campaignPlainText(request.body);
+  if (!subject || !plainText) return response.status(400).json({ error: "Cần có tiêu đề và nội dung HTML." });
   const rawCollectionUrl = cleanText(request.body.collectionUrl), collectionUrl = rawCollectionUrl ? safeDestination(rawCollectionUrl) : "";
   if (rawCollectionUrl && !collectionUrl) return response.status(400).json({ error: "Collection URL cần là liên kết http/https hợp lệ." });
-  if (/{{\s*collection_url\s*}}/i.test(plainText) && !collectionUrl) return response.status(400).json({ error: "Nội dung đang có {{collection_url}} nhưng chưa chọn/dán Collection URL." });
+  if (/{{\s*collection_url\s*}}/i.test(`${plainText}\n${request.body.htmlBody || ""}`) && !collectionUrl) return response.status(400).json({ error: "Nội dung đang có {{collection_url}} nhưng chưa chọn/dán Collection URL." });
   let audience;
   try { audience = campaignRequestedRecipients(request.body, false); } catch (error) { return response.status(400).json({ error: error.message }); }
   const duplicates = inspectCampaignDuplicates(request.body, audience.requested).filter((item) => item.isDuplicate);
@@ -346,8 +422,9 @@ app.post("/api/campaigns/preview", (request, response) => {
 });
 
 app.post("/api/campaigns/send", async (request, response) => {
-  const subject = cleanSubject(request.body.subject), plainText = cleanText(request.body.plainText);
-  if (!subject || !plainText) return response.status(400).json({ error: "Cần có tiêu đề và nội dung Text." });
+  const subject = cleanSubject(request.body.subject), plainText = campaignPlainText(request.body);
+  const htmlBody = String(request.body.htmlBody ?? request.body.htmlPreview ?? "").trim().slice(0, 500_000);
+  if (!subject || (!plainText && !htmlBody)) return response.status(400).json({ error: "Cần có tiêu đề và nội dung HTML." });
   if (database.campaigns.some((campaign) => ["running", "paused"].includes(campaign.status))) return response.status(409).json({ error: "Đang có một chiến dịch chưa hoàn tất. Hãy Pause/Resume hoặc chờ chiến dịch đó gửi xong." });
   let audience;
   try { audience = campaignRequestedRecipients(request.body, true); } catch (error) { return response.status(400).json({ error: error.message }); }
@@ -355,7 +432,7 @@ app.post("/api/campaigns/send", async (request, response) => {
   if (!requested.length) return response.status(400).json({ error: "Chưa chọn đội hoặc nhóm email." });
   const collectionUrl = safeDestination(cleanText(request.body.collectionUrl)) || "";
   if (cleanText(request.body.collectionUrl) && !collectionUrl) return response.status(400).json({ error: "Collection URL cần là liên kết http/https hợp lệ." });
-  if (/{{\s*collection_url\s*}}/i.test(plainText) && !collectionUrl) return response.status(400).json({ error: "Nội dung đang có {{collection_url}} nhưng chưa chọn/dán Collection URL." });
+  if (/{{\s*collection_url\s*}}/i.test(`${plainText}\n${htmlBody}`) && !collectionUrl) return response.status(400).json({ error: "Nội dung đang có {{collection_url}} nhưng chưa chọn/dán Collection URL." });
   const duplicateChecks = inspectCampaignDuplicates(request.body, requested);
   const duplicatesByEmail = new Map(duplicateChecks.filter((item) => item.isDuplicate).map((item) => [item.email.toLowerCase(), item]));
   saveDatabase();
@@ -376,7 +453,7 @@ app.post("/api/campaigns/send", async (request, response) => {
     return base;
   });
   const campaign = {
-    id: newId("campaign"), createdAt: new Date().toISOString(), subject, plainText, htmlPreview: cleanText(request.body.htmlPreview), contentHash: fingerprint,
+    id: newId("campaign"), createdAt: new Date().toISOString(), subject, plainText, htmlBody, contentHash: fingerprint,
     group: selectedGroups[0] || "Danh sách nhập tay", collectionUrl, funnel: cleanText(request.body.funnel), type: cleanText(request.body.type),
     utmCampaign: cleanText(request.body.utmCampaign) || `email_${Date.now()}`, trackerBaseUrl: getPublicBaseUrl(request), addGreeting: request.body.addGreeting !== false, recipients, status: "running", nextSendAt: null, completedAt: null,
   };
@@ -424,5 +501,10 @@ app.post("/event/:token", (request, response) => {
   database.events.push({ id: newId("event"), campaignId: campaign.id, token: request.params.token, type, createdAt: new Date().toISOString(), value: Number(request.body.value || 0) || undefined }); saveDatabase(); response.status(201).json({ ok: true });
 });
 app.use((error, _request, response, _next) => { console.error(error); response.status(400).json({ error: error.message || "Yêu cầu không hợp lệ." }); });
-writeTeamFiles();
-app.listen(port, host, () => { console.log(`Nodemail đang chạy tại http://127.0.0.1:${port}`); if (database.campaigns.some((campaign) => campaign.status === "running")) scheduleWorker(0); });
+if (!cloud.enabled) {
+  writeTeamFiles();
+  app.listen(port, host, () => { console.log(`Nodemail đang chạy tại http://127.0.0.1:${port}`); if (database.campaigns.some((campaign) => campaign.status === "running")) scheduleWorker(0); });
+}
+module.exports = app;
+module.exports.queueHelpers = { getTransporter, personalize, composeRecipientText, recordSent, finishCampaignIfDone, randomDelay };
+

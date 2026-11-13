@@ -1,5 +1,15 @@
 # Nodemail nội bộ
 
+## Vercel
+
+Trong bản online, mở **Cấu hình email Namecheap** ở đầu trang để nhập host, cổng, tài khoản và mật khẩu hộp thư. Mật khẩu được mã hóa AES-256-GCM bằng biến `SMTP_CONFIG_KEY` (32 byte ngẫu nhiên mã hóa base64), rồi lưu trong Blob private; API không trả mật khẩu về trình duyệt. Giữ khóa này ổn định khi redeploy. Nút **Kiểm tra kết nối** chỉ xác thực SMTP, không gửi thư.
+
+Trên Vercel, cấu hình một Blob store **private** nối với project và giữ biến `BLOB_READ_WRITE_TOKEN`. Các biến SMTP giữ nguyên như `.env.example`; đặt `TRACKER_PUBLIC_URL` bằng domain HTTPS của app. Không upload `.env`, danh sách khách hàng hoặc lịch sử local lên GitHub.
+
+App online lưu recipients, campaign, nội dung từng đội và lịch sử vào Blob private. Vercel Queues gọi `api/mail-worker.js` để gửi từng mail và hẹn lượt tiếp theo sau 1–2 phút. Không cần giữ tab hoặc máy tính bật. Khi kết quả gửi SMTP không xác định sau khi worker dừng đột ngột, chiến dịch được pause để kiểm tra thủ công thay vì tự gửi trùng.
+
+Deployment Protection bảo vệ app quản trị. Nếu giữ bảo vệ trên toàn deployment, người nhận ngoài team cũng bị yêu cầu đăng nhập khi mở link tracking; cần cấu hình domain/tracking public cùng lớp xác thực quản trị phù hợp trước khi gửi chiến dịch thật. SMTP chưa được cấu hình sẽ hiển thị trong phần cài đặt và chặn tạo chiến dịch.
+
 Giao diện nội bộ để nhập danh sách Excel đã phân nhóm, soạn email, gửi **Plain Text** qua SMTP và theo dõi đường đi của từng người nhận qua token riêng.
 
 ## Yêu cầu
@@ -48,3 +58,4 @@ Mỗi URL trong nội dung Text được đổi sang đường dẫn `/r/{token}
 Measurement ID `G-029PNZ8EV2` chỉ cho GA4 biết dữ liệu tổng hợp nếu Google tag đã có trên website. Nó **không tự trả về** việc một email cụ thể đã thêm giỏ/checkout/mua hàng. Để dashboard Nodemail thấy từng khách, thêm lời gọi event hiển thị trong tab **Theo dõi khách hàng** vào các event ecommerce của website. Lời gọi đó lấy token từ `utm_content` và gửi `add_to_cart`, `begin_checkout` hoặc `purchase` về tracker.
 
 Vì email Plain Text không có pixel mở mail, ứng dụng theo dõi click và các hành động sau click, không tuyên bố đo "open".
+

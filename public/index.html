@@ -7,6 +7,7 @@
     <link rel="stylesheet" href="/styles.css" />
     <style>.source-actions{display:flex;align-items:center;gap:10px;margin-top:16px}.greeting-toggle{display:flex;align-items:center;gap:8px;margin:12px 0;font-weight:600}.greeting-toggle input{display:inline-block;width:auto;margin:0}.queue-status{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-top:16px;padding:13px 15px;border:1px solid #b9d5ff;background:#f2f7ff;border-radius:8px}.queue-status span{display:block;color:#4b617d;font-size:13px;margin-top:3px}@media(max-width:800px){.queue-status{align-items:flex-start;flex-direction:column}}</style>
     <style>.team-file-tools{margin-top:10px}.team-file-tools .upload-box{margin:6px 0 0}.upload-box.compact{padding:11px 13px}.upload-box.compact input{display:none}.team-heading{display:flex;justify-content:space-between;gap:10px;margin:12px 0 4px}.group{align-items:flex-start}.group input{width:auto;margin:3px 0 0}.group span small{display:block;font-size:10px}.manual-recipient-box{border-top:1px solid var(--line);margin-top:15px;padding-top:12px}.manual-recipient-box summary{font-weight:700;cursor:pointer}.manual-emails{min-height:90px;max-height:200px}.progress-track{height:8px;background:#dbe5f1;border-radius:99px;overflow:hidden;margin:9px 0}.progress-fill{height:100%;background:#087f5b;transition:width .3s}.queue-main{flex:1}.queue-main small{display:block;word-break:break-word}.queue-status{width:100%}</style>
+    <style>.email-workspace{grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start;margin-top:16px}.editor-label{display:block;margin-bottom:7px;font-size:13px;font-weight:750;color:#334155}.html-editor{height:520px;min-height:360px;resize:vertical;tab-size:2;white-space:pre;overflow:auto;line-height:1.55}.email-preview-column{min-width:0}.email-preview-column .preview-wrap{margin:0;border-color:#d9e1e9;background:#eef2f6;box-shadow:inset 0 0 0 1px #fff}.email-preview-column iframe{display:block;height:520px;background:#eef2f6}.hint code{font-size:12px}@media(max-width:850px){.email-workspace{grid-template-columns:1fr}.html-editor,.email-preview-column iframe{height:420px}}</style>
   </head>
   <body>
     <header>
@@ -14,6 +15,17 @@
       <div id="connectionState" class="connection">Đang kiểm tra SMTP…</div>
     </header>
     <main>
+      <details class="panel" id="smtpSettingsPanel">
+        <summary><strong>Cấu hình email Namecheap</strong> — điền một lần để gửi online</summary>
+        <form id="smtpSettingsForm">
+          <p class="hint">Private Email thường dùng mail.privateemail.com, cổng 465 (TLS). Nếu bạn dùng email cPanel hosting, nhập mail server do Namecheap cấp cho hosting đó.</p>
+          <div class="fields two"><label>SMTP host<input id="smtpHost" value="mail.privateemail.com" required /></label><label>Cổng và bảo mật<select id="smtpPort"><option value="465">465 · TLS</option><option value="587">587 · STARTTLS</option></select></label></div>
+          <div class="fields two"><label>Email gửi<input id="smtpUser" type="email" autocomplete="username" required placeholder="sale@viluxzone.com" /></label><label>Mật khẩu hộp thư<input id="smtpPassword" type="password" autocomplete="new-password" placeholder="Điền mật khẩu; để trống để giữ mật khẩu đã lưu" /></label></div>
+          <label>Tên và địa chỉ From<input id="smtpFrom" placeholder='Viluxzone <sale@viluxzone.com>' /></label>
+          <p class="hint">Mật khẩu được mã hóa trên server, không được trả lại về trình duyệt. Kiểm tra kết nối không gửi email.</p>
+          <div class="source-actions"><button type="submit" class="secondary">Lưu SMTP</button><button type="button" id="smtpVerify" class="secondary">Kiểm tra kết nối</button><span id="smtpMessage" role="status"></span></div>
+        </form>
+      </details>
       <nav aria-label="Điều hướng chính">
         <button class="tab active" data-view="compose">Soạn & gửi</button>
         <button class="tab" data-view="tracking">Theo dõi khách hàng</button>
@@ -45,13 +57,11 @@
           <div class="fields two"><label>Collection có sẵn<select id="collectionPicker"><option value="">Tự nhập link bên cạnh</option></select></label><label>Collection URL<input id="collectionUrl" type="url" placeholder="Dán URL collection/sản phẩm tùy ý" /></label></div>
           <div class="source-actions"><button id="saveTeamContent" class="secondary">Lưu nội dung riêng cho đội</button><span id="contentSaveStatus" class="hint"></span></div>
           <div class="fields two"><label>Tiêu đề<input id="subject" maxlength="200" placeholder="Ví dụ: A new look for matchday" /></label><label>Funnel / loại chiến dịch<input id="funnel" maxlength="100" placeholder="Ví dụ: NEW COLLECTION, WINBACK" /></label></div>
-          <p class="hint">Biến: <code>{{name}}</code>, <code>{{email}}</code>, <code>{{group}}</code>, <code>{{collection_url}}</code>. Link collection sẽ được thay bằng link tracking riêng cho từng email.</p>
-          <label class="greeting-toggle"><input id="addGreeting" type="checkbox" checked /> Tự thêm <code>Dear {{name}},</code> cho khách có tên trong file Excel</label>
-          <div class="editor-grid">
-            <label>Text gửi khách hàng<textarea id="plainText" spellcheck="true" placeholder="Nội dung email dạng text. Dán URL đích vào đây để tự gắn tracking."></textarea></label>
-            <label>HTML để đối chiếu<textarea id="htmlPreview" class="code" spellcheck="false" placeholder="Dán HTML email để xem trước. Nội dung này không được gửi."></textarea></label>
+          <p class="hint">Dán HTML email ở khung trái; khung phải xem trước trực tiếp. Biến hỗ trợ: <code>{{name}}</code>, <code>{{email}}</code>, <code>{{group}}</code>, <code>{{collection_url}}</code>. Hệ thống chỉ thay URL trong <code>href</code> bằng link tracking, giữ nguyên chữ hiển thị trên email.</p>
+          <div class="editor-grid email-workspace">
+            <label><span class="editor-label">HTML nội dung gửi</span><textarea id="htmlBody" class="code html-editor" spellcheck="false" placeholder="Dán HTML email của bạn vào đây…"></textarea></label>
+            <div class="email-preview-column"><div class="editor-label">Xem trước email</div><div class="preview-wrap"><iframe id="htmlFrame" title="Xem trước HTML" sandbox="allow-popups allow-popups-to-escape-sandbox"></iframe></div></div>
           </div>
-          <div class="preview-wrap"><div class="preview-title">Xem trước HTML</div><iframe id="htmlFrame" title="Xem trước HTML"></iframe></div>
           <div class="send-row"><span id="sendHint">Chọn một đội hoặc nhập danh sách email thủ công.</span><button id="sendButton" class="primary">Bắt đầu gửi</button></div>
           <div id="queueStatus" class="queue-status" aria-live="polite"></div>
         </article>
@@ -65,5 +75,6 @@
     </main>
     <div id="toast" role="status" aria-live="polite"></div>
     <script src="/app.js"></script>
+    <script src="/smtp-settings.js"></script>
   </body>
 </html>
