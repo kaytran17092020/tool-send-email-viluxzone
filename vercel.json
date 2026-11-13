@@ -1,0 +1,12 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "express",
+  "regions": ["sin1"],
+  "functions": {
+    "index.js": { "maxDuration": 60 },
+    "api/mail-worker.js": {
+      "maxDuration": 60,
+      "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "nodemail-send", "maxConcurrency": 1 }]
+    }
+  }
+}

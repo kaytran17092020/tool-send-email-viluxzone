@@ -1,5 +1,13 @@
 # Nodemail nội bộ
 
+## Vercel
+
+Trên Vercel, cấu hình một Blob store **private** nối với project và giữ biến `BLOB_READ_WRITE_TOKEN`. Các biến SMTP giữ nguyên như `.env.example`; đặt `TRACKER_PUBLIC_URL` bằng domain HTTPS của app. Không upload `.env`, danh sách khách hàng hoặc lịch sử local lên GitHub.
+
+App online lưu recipients, campaign, nội dung từng đội và lịch sử vào Blob private bằng ghi có kiểm tra ETag. Vercel Queues gọi `api/mail-worker.js` để gửi từng mail và hẹn lượt tiếp theo sau 1–2 phút. Không cần giữ tab hoặc máy tính bật. Khi kết quả gửi SMTP không xác định sau khi worker dừng đột ngột, chiến dịch được pause để kiểm tra thủ công thay vì tự gửi trùng.
+
+Deployment Protection bảo vệ app quản trị. Nếu giữ bảo vệ trên toàn deployment, người nhận ngoài team cũng bị yêu cầu đăng nhập khi mở link tracking; cần cấu hình domain/tracking public cùng lớp xác thực quản trị phù hợp trước khi gửi chiến dịch thật. SMTP chưa được cấu hình sẽ hiển thị trong phần cài đặt và chặn tạo chiến dịch.
+
 Giao diện nội bộ để nhập danh sách Excel đã phân nhóm, soạn email, gửi **Plain Text** qua SMTP và theo dõi đường đi của từng người nhận qua token riêng.
 
 ## Yêu cầu

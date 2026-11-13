@@ -8,12 +8,16 @@ const multer = require("multer");
 const nodemailer = require("nodemailer");
 const XLSX = require("xlsx");
 const { CLUB_COLLECTIONS } = require("./club-data");
-const { loadSentHistory, saveSentHistory, createHistoryIndex, inspectDuplicate, recordSent } = require("./sent-history");
+const historyFiles = require("./sent-history");
+const { createHistoryIndex, inspectDuplicate, recordSent } = historyFiles;
+const cloud = require("./cloud-store");
+function loadSentHistory(file) { return cloud.current()?.history || historyFiles.loadSentHistory(file); }
+function saveSentHistory(file, history) { if (cloud.current()) { cloud.current().history = history; cloud.dirty(); } else historyFiles.saveSentHistory(file, history); }
 
 const app = express();
 const port = Number(process.env.PORT || 3030);
 const host = process.env.HOST || "127.0.0.1";
-const dataDirectory = path.join(__dirname, "data");
+const dataDirectory = process.env.VERCEL ? "/tmp/nodemail" : path.join(__dirname, "data");
 const databaseFile = path.join(dataDirectory, "mail-data.json");
 const teamFilesDirectory = path.join(dataDirectory, "team-files");
 const teamContentDirectory = path.join(dataDirectory, "team-content");
@@ -59,8 +63,13 @@ function loadDatabase() {
     return { recipients: [], campaigns: [], events: [] };
   }
 }
-let database = loadDatabase();
+const localDatabase = loadDatabase();
+const database = new Proxy(localDatabase, {
+  get(target, key) { return (cloud.current()?.data || target)[key]; },
+  set(target, key, value) { (cloud.current()?.data || target)[key] = value; return true; },
+});
 function saveDatabase() {
+  if (cloud.current()) { cloud.dirty(); return; }
   const temporaryFile = `${databaseFile}.tmp`;
   fs.writeFileSync(temporaryFile, JSON.stringify(database, null, 2), "utf8");
   fs.renameSync(temporaryFile, databaseFile);
@@ -80,6 +89,7 @@ function defaultTeamCampaign(group) {
   };
 }
 function writeTeamFiles() {
+  if (cloud.current()) return;
   const groups = new Map();
   for (const recipient of database.recipients) {
     const group = recipient.group || "Chưa phân loại";
@@ -98,6 +108,7 @@ function writeTeamFiles() {
 }
 function resolveTeamContentFile(group) { return path.join(teamContentDirectory, `${teamFileSlug(group)}.json`); }
 function loadTeamContent(group) {
+  if (cloud.current()) return cloud.current().teamContent[teamFileSlug(group)] || null;
   try { return JSON.parse(fs.readFileSync(resolveTeamContentFile(group), "utf8")); } catch { return null; }
 }
 function getPublicBaseUrl(request) {
@@ -159,6 +170,7 @@ let workerTimer = null;
 let workerBusy = false;
 function clearWorkerTimer() { if (workerTimer) clearTimeout(workerTimer); workerTimer = null; }
 function scheduleWorker(delayMs = 0) {
+  if (cloud.enabled) { cloud.schedule(delayMs); return; }
   clearWorkerTimer();
   workerTimer = setTimeout(() => { workerTimer = null; runQueue().catch((error) => console.error("Queue error:", error)); }, Math.max(delayMs, 0));
 }
@@ -245,6 +257,7 @@ function parseRecipientWorkbook(buffer, forcedGroup = "") {
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, "public")));
+if (cloud.enabled) app.use(cloud.middleware);
 app.get("/api/settings", (request, response) => response.json({
   trackerBaseUrl: getPublicBaseUrl(request), trackerIsPublic: Boolean(process.env.TRACKER_PUBLIC_URL), googleMeasurementId: process.env.GA4_MEASUREMENT_ID || "G-029PNZ8EV2",
   smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && !/your-domain|replace-with/i.test(`${process.env.SMTP_USER} ${process.env.SMTP_PASS}`)), from: process.env.SMTP_FROM || process.env.SMTP_USER || "",
@@ -284,7 +297,8 @@ app.put("/api/team-content", (request, response) => {
     collectionUrl,
     updatedAt: new Date().toISOString(),
   };
-  fs.writeFileSync(resolveTeamContentFile(group), JSON.stringify(content, null, 2), "utf8");
+  if (cloud.current()) { cloud.current().teamContent[teamFileSlug(group)] = content; cloud.dirty(); }
+  else fs.writeFileSync(resolveTeamContentFile(group), JSON.stringify(content, null, 2), "utf8");
   response.json({ ok: true, group: content.group, updatedAt: content.updatedAt });
 });
 app.get("/api/teams/export", (request, response) => {
@@ -424,5 +438,9 @@ app.post("/event/:token", (request, response) => {
   database.events.push({ id: newId("event"), campaignId: campaign.id, token: request.params.token, type, createdAt: new Date().toISOString(), value: Number(request.body.value || 0) || undefined }); saveDatabase(); response.status(201).json({ ok: true });
 });
 app.use((error, _request, response, _next) => { console.error(error); response.status(400).json({ error: error.message || "Yêu cầu không hợp lệ." }); });
-writeTeamFiles();
-app.listen(port, host, () => { console.log(`Nodemail đang chạy tại http://127.0.0.1:${port}`); if (database.campaigns.some((campaign) => campaign.status === "running")) scheduleWorker(0); });
+if (!cloud.enabled) {
+  writeTeamFiles();
+  app.listen(port, host, () => { console.log(`Nodemail đang chạy tại http://127.0.0.1:${port}`); if (database.campaigns.some((campaign) => campaign.status === "running")) scheduleWorker(0); });
+}
+module.exports = app;
+module.exports.queueHelpers = { getTransporter, personalize, composeRecipientText, recordSent, finishCampaignIfDone, randomDelay };
