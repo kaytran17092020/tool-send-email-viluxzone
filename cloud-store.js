@@ -9,23 +9,16 @@ const queue = new QueueClient({ region: "sin1" });
 const statePath = "nodemail/state.json";
 const topic = "nodemail-send-v2";
 
-async function load(verifyEtag = false) {
+async function load() {
   const result = await get(statePath, { access: "private", useCache: false });
   if (!result) return { data: { recipients: [], campaigns: [], events: [] }, history: {}, teamContent: {}, etag: null, dirty: false, wake: null };
   const state = JSON.parse(await new Response(result.stream).text());
-  let etag = result.blob.etag;
-  if (verifyEtag) {
-    const current = await head(statePath, { access: "private" });
-    if (!current || current.etag !== etag) throw new Error("Vercel Blob state changed during read.");
-    etag = current.etag;
-  }
-  return { ...state, etag, dirty: false, wake: null };
+  return { ...state, etag: result.blob.etag, dirty: false, wake: null };
 }
 
 async function save(context) {
   if (!context.dirty) return;
-  const options = { access: "private", addRandomSuffix: false, contentType: "application/json", cacheControlMaxAge: 60 };
-  if (context.etag) Object.assign(options, { allowOverwrite: true, ifMatch: context.etag });
+  const options = { access: "private", addRandomSuffix: false, allowOverwrite: true, contentType: "application/json", cacheControlMaxAge: 60 };
   const result = await put(statePath, JSON.stringify({ data: context.data, history: context.history, teamContent: context.teamContent, smtp: context.smtp }), options);
   context.etag = result.etag;
   context.dirty = false;
@@ -68,12 +61,7 @@ async function transaction(update) {
   let lastConflict = null;
   for (let attempt = 0; attempt < 12; attempt += 1) {
     let context;
-    try { context = await load(true); } catch (error) {
-      if (!/state changed during read/i.test(error.message)) throw error;
-      lastConflict = error;
-      if (attempt < 11) await new Promise((resolve) => setTimeout(resolve, 25 + Math.floor(Math.random() * (25 * (attempt + 1)))));
-      continue;
-    }
+    context = await load();
     const value = update(context);
     try { await save(context); return value; } catch (error) {
       const conflict = error.name === "BlobPreconditionFailedError" || error.status === 412 || error.statusCode === 412 || /already exists|precondition failed|etag mismatch/i.test(error.message);
