@@ -580,5 +580,5 @@ if (!cloud.enabled) {
   app.listen(port, host, () => { console.log(`Nodemail đang chạy tại http://127.0.0.1:${port}`); if (database.campaigns.some((campaign) => campaign.status === "running")) scheduleWorker(0); });
 }
 module.exports = app;
-module.exports.queueHelpers = { getTransporter, personalize, composeRecipientText, recordSent, finishCampaignIfDone, randomDelay };
+module.exports.queueHelpers = { getTransporter, personalize, composeRecipientText, campaignHtmlSource, personalizeHtml, recordSent, finishCampaignIfDone, randomDelay };
 

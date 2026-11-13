@@ -109,6 +109,7 @@ async function deliver(helpers) {
       to: claim.recipient.email,
       subject: helpers.personalize(claim.campaign.subject, claim.recipient),
       text: helpers.composeRecipientText(claim.campaign, claim.recipient),
+      html: helpers.personalizeHtml(helpers.campaignHtmlSource(claim.campaign), claim.campaign, claim.recipient),
     });
   } catch (error) {
     sendError = error.message;
