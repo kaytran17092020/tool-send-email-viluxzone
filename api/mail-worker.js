@@ -10,7 +10,7 @@ module.exports = cloud.queue.handleNodeCallback(async (message) => {
   console.info("mail queue wake received");
   try { return await cloud.deliver(queueHelpers); }
   catch (error) {
-    console.error("mail queue delivery failed", { code: error.code || "WORKER_ERROR" });
+    console.error("mail queue delivery failed", { name: error.name || "Error", code: error.code || "WORKER_ERROR" });
     throw error;
   }
 }, {
