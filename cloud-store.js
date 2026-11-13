@@ -59,16 +59,18 @@ function middleware(request, response, next) {
 }
 
 async function transaction(update) {
+  let lastConflict = null;
   for (let attempt = 0; attempt < 12; attempt += 1) {
     const context = await load();
     const value = update(context);
     try { await save(context); return value; } catch (error) {
       const conflict = error.name === "BlobPreconditionFailedError" || error.status === 412 || error.statusCode === 412 || /already exists|precondition failed|etag mismatch/i.test(error.message);
       if (!conflict) throw error;
+      lastConflict = error;
       if (attempt < 11) await new Promise((resolve) => setTimeout(resolve, 25 + Math.floor(Math.random() * (25 * (attempt + 1)))));
     }
   }
-  console.error("cloud transaction retries exhausted");
+  console.error("cloud transaction retries exhausted", { name: lastConflict?.name || "Error", status: lastConflict?.status || lastConflict?.statusCode || null, message: String(lastConflict?.message || "").slice(0, 140) });
   throw new Error("Cloud data contention");
 }
 
