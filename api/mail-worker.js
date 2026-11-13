@@ -1,5 +1,5 @@
 const cloud = require("../cloud-store");
-const { queueHelpers } = require("../index");
+const { queueHelpers } = require("../indexAI");
 
 module.exports = cloud.queue.handleNodeCallback(async (message) => {
   if (message?.probe === true) return cloud.recordQueueProbe();
