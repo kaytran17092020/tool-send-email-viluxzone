@@ -14,6 +14,17 @@
       <div id="connectionState" class="connection">Đang kiểm tra SMTP…</div>
     </header>
     <main>
+      <details class="panel" id="smtpSettingsPanel">
+        <summary><strong>Cấu hình email Namecheap</strong> — điền một lần để gửi online</summary>
+        <form id="smtpSettingsForm">
+          <p class="hint">Private Email thường dùng mail.privateemail.com, cổng 465 (TLS). Nếu bạn dùng email cPanel hosting, nhập mail server do Namecheap cấp cho hosting đó.</p>
+          <div class="fields two"><label>SMTP host<input id="smtpHost" value="mail.privateemail.com" required /></label><label>Cổng và bảo mật<select id="smtpPort"><option value="465">465 · TLS</option><option value="587">587 · STARTTLS</option></select></label></div>
+          <div class="fields two"><label>Email gửi<input id="smtpUser" type="email" autocomplete="username" required placeholder="sale@viluxzone.com" /></label><label>Mật khẩu hộp thư<input id="smtpPassword" type="password" autocomplete="new-password" placeholder="Điền mật khẩu; để trống để giữ mật khẩu đã lưu" /></label></div>
+          <label>Tên và địa chỉ From<input id="smtpFrom" placeholder='Viluxzone <sale@viluxzone.com>' /></label>
+          <p class="hint">Mật khẩu được mã hóa trên server, không được trả lại về trình duyệt. Kiểm tra kết nối không gửi email.</p>
+          <div class="source-actions"><button type="submit" class="secondary">Lưu SMTP</button><button type="button" id="smtpVerify" class="secondary">Kiểm tra kết nối</button><span id="smtpMessage" role="status"></span></div>
+        </form>
+      </details>
       <nav aria-label="Điều hướng chính">
         <button class="tab active" data-view="compose">Soạn & gửi</button>
         <button class="tab" data-view="tracking">Theo dõi khách hàng</button>
@@ -65,5 +76,6 @@
     </main>
     <div id="toast" role="status" aria-live="polite"></div>
     <script src="/app.js"></script>
+    <script src="/smtp-settings.js"></script>
   </body>
 </html>

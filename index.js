@@ -11,6 +11,7 @@ const { CLUB_COLLECTIONS } = require("./club-data");
 const historyFiles = require("./sent-history");
 const { createHistoryIndex, inspectDuplicate, recordSent } = historyFiles;
 const cloud = require("./cloud-store");
+const smtpSettings = require("./smtp-settings");
 function loadSentHistory(file) { return cloud.current()?.history || historyFiles.loadSentHistory(file); }
 function saveSentHistory(file, history) { if (cloud.current()) { cloud.current().history = history; cloud.dirty(); } else historyFiles.saveSentHistory(file, history); }
 
@@ -136,11 +137,14 @@ function composeRecipientText(campaign, recipient) {
   return replaceLinks(`${greeting}${body}`, campaign, recipient, campaign.trackerBaseUrl);
 }
 function safeDestination(value) { try { const url = new URL(value); return ["http:", "https:"].includes(url.protocol) ? url.toString() : null; } catch { return null; } }
-function getTransporter() {
-  const host = cleanText(process.env.SMTP_HOST), user = cleanText(process.env.SMTP_USER), password = cleanText(process.env.SMTP_PASS);
+function getSmtpConfig(encrypted) { return smtpSettings.decrypt(encrypted || cloud.current()?.smtp) || smtpSettings.environment(); }
+function getTransporter(encrypted) {
+  const config = getSmtpConfig(encrypted);
+  const host = cleanText(config.host), user = cleanText(config.user), password = config.password;
   if (!host || !user || !password) throw new Error("Thiếu SMTP_HOST, SMTP_USER hoặc SMTP_PASS trong file .env.");
   if (/your-domain|replace-with/i.test(`${user} ${password}`)) throw new Error("SMTP vẫn dùng thông tin mẫu. Hãy điền biến môi trường SMTP hợp lệ.");
-  return nodemailer.createTransport({ host, port: Number(process.env.SMTP_PORT || 465), secure: cleanText(process.env.SMTP_SECURE || "true").toLowerCase() !== "false", auth: { user, pass: password } });
+  return nodemailer.createTransport({ host, port: config.port, secure: config.secure, requireTLS: !config.secure,
+    from: config.from || user, connectionTimeout: 15000, greetingTimeout: 15000, socketTimeout: 25000, auth: { user, pass: password } });
 }
 function recipientPayload() {
   const groups = {};
@@ -268,9 +272,32 @@ app.get("/api/health", async (request, response) => {
   }
   response.json({ ok: true, storage: cloud.enabled ? "private-blob" : "local", smtp: request.query.smtp === "true" ? "verified" : "not-tested", queueProbe });
 });
+app.get("/api/smtp-settings", (_request, response) => {
+  const config = getSmtpConfig();
+  response.set("Cache-Control", "no-store").json({ host: config.host, port: config.port, secure: config.secure,
+    user: /your-domain/.test(config.user) ? "" : config.user, from: /your-domain/.test(config.from) ? "" : config.from,
+    passwordSaved: smtpSettings.configured(config), editable: cloud.enabled });
+});
+app.put("/api/smtp-settings", (request, response) => {
+  if (!cloud.current()) return response.status(400).json({ error: "Bản local dùng file .env." });
+  if (database.campaigns.some((campaign) => campaign.status === "running")) return response.status(409).json({ error: "Pause chiến dịch trước khi đổi SMTP." });
+  const previous = getSmtpConfig();
+  const config = { host: cleanText(request.body.host), port: Number(request.body.port), secure: request.body.secure === true,
+    user: cleanText(request.body.user), password: String(request.body.password || "") || (previous.user === cleanText(request.body.user) ? previous.password : ""),
+    from: cleanText(request.body.from) || cleanText(request.body.user) };
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(config.host) || ![465, 587].includes(config.port) || !isEmail(config.user) || !smtpSettings.configured(config)
+      || config.password.length > 4096 || /[\r\n]/.test(config.from)) return response.status(400).json({ error: "Điền host, cổng 465/587, email và mật khẩu SMTP hợp lệ." });
+  cloud.current().smtp = smtpSettings.encrypt(config);
+  cloud.dirty();
+  response.json({ ok: true });
+});
+app.post("/api/smtp-verify", async (_request, response) => {
+  try { await getTransporter().verify(); response.json({ ok: true, message: "Kết nối SMTP thành công. Chưa gửi email." }); }
+  catch (error) { response.status(400).json({ error: `Không kết nối được SMTP (${error.code || "CONFIG_ERROR"}). Kiểm tra host, email và mật khẩu hộp thư.` }); }
+});
 app.get("/api/settings", (request, response) => response.json({
   trackerBaseUrl: getPublicBaseUrl(request), trackerIsPublic: Boolean(process.env.TRACKER_PUBLIC_URL) && (!cloud.enabled || process.env.TRACKER_PUBLIC_ACCESS === "true"), googleMeasurementId: process.env.GA4_MEASUREMENT_ID || "G-029PNZ8EV2",
-  smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && !/your-domain|replace-with/i.test(`${process.env.SMTP_USER} ${process.env.SMTP_PASS}`)), from: process.env.SMTP_FROM || process.env.SMTP_USER || "",
+  smtpConfigured: smtpSettings.configured(getSmtpConfig()), from: getSmtpConfig().from,
   defaultRecipientFileConfigured: Boolean(defaultRecipientFile), defaultRecipientFileName: defaultRecipientFile ? path.basename(defaultRecipientFile) : "", delayMinMinutes: sendDelayMinMs / 60_000, delayMaxMinutes: sendDelayMaxMs / 60_000,
 }));
 app.post("/api/recipients/import", upload.single("file"), (request, response) => {

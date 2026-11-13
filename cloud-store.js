@@ -20,7 +20,7 @@ async function save(context) {
   if (!context.dirty) return;
   const options = { access: "private", addRandomSuffix: false, contentType: "application/json", cacheControlMaxAge: 60 };
   if (context.etag) Object.assign(options, { allowOverwrite: true, ifMatch: context.etag });
-  const result = await put(statePath, JSON.stringify({ data: context.data, history: context.history, teamContent: context.teamContent }), options);
+  const result = await put(statePath, JSON.stringify({ data: context.data, history: context.history, teamContent: context.teamContent, smtp: context.smtp }), options);
   context.etag = result.etag;
   context.dirty = false;
 }
@@ -89,14 +89,15 @@ async function deliver(helpers) {
     recipient.status = "sending";
     recipient.claimId = claimId;
     context.dirty = true;
-    return { campaign: structuredClone(campaign), recipient: structuredClone(recipient) };
+    return { campaign: structuredClone(campaign), recipient: structuredClone(recipient), smtp: context.smtp };
   });
   if (!claim) return;
   if (claim.delay) return publish(claim.delay);
   let sendError = null;
   try {
-    await helpers.getTransporter().sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    const transporter = helpers.getTransporter(claim.smtp);
+    await transporter.sendMail({
+      from: transporter.options.from || process.env.SMTP_FROM || process.env.SMTP_USER,
       to: claim.recipient.email,
       subject: helpers.personalize(claim.campaign.subject, claim.recipient),
       text: helpers.composeRecipientText(claim.campaign, claim.recipient),
