@@ -1,9 +1,14 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": "express",
+  "framework": null,
   "regions": ["sin1"],
+  "rewrites": [
+    { "source": "/api/:path((?!mail-worker$).*)", "destination": "/api/index" },
+    { "source": "/r/:token", "destination": "/api/index" },
+    { "source": "/event/:token", "destination": "/api/index" }
+  ],
   "functions": {
-    "index.js": { "maxDuration": 60 },
+    "api/index.js": { "maxDuration": 60 },
     "api/mail-worker.js": {
       "maxDuration": 60,
       "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "nodemail-send", "maxConcurrency": 1 }]
