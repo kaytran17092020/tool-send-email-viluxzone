@@ -1,6 +1,6 @@
 const { AsyncLocalStorage } = require("node:async_hooks");
 const crypto = require("node:crypto");
-const { get, put, del } = require("@vercel/blob");
+const { get, head, put, del } = require("@vercel/blob");
 const { QueueClient } = require("@vercel/queue");
 
 const enabled = Boolean(process.env.VERCEL);
@@ -142,6 +142,8 @@ async function probe() {
   try {
     const result = await get(uploaded.url, { access: "private", useCache: false });
     if (!result || !(await new Response(result.stream).json()).ok) throw new Error("Storage probe failed");
+    const metadata = await head(pathname, { access: "private" });
+    await put(pathname, '{"ok":true,"updated":true}', { access: "private", addRandomSuffix: false, allowOverwrite: true, ifMatch: metadata.etag });
   } finally { await del(uploaded.url); }
 }
 
