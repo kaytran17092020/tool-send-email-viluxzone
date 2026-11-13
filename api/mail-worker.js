@@ -8,7 +8,11 @@ module.exports = cloud.queue.handleNodeCallback(async (message) => {
     if (message.wake !== true) return;
   }
   console.info("mail queue wake received");
-  return cloud.deliver(queueHelpers);
+  try { return await cloud.deliver(queueHelpers); }
+  catch (error) {
+    console.error("mail queue delivery failed", { code: error.code || "WORKER_ERROR" });
+    throw error;
+  }
 }, {
   retry(error, metadata) {
     if (metadata.deliveryCount > 5) return { acknowledge: true };

@@ -93,6 +93,7 @@ async function deliver(helpers) {
     context.dirty = true;
     return { campaign: structuredClone(campaign), recipient: structuredClone(recipient), smtp: context.smtp };
   });
+  console.info("mail worker claim", { claimed: Boolean(claim?.recipient), delayed: Boolean(claim?.delay), campaignId: claim?.campaign?.id || null });
   if (!claim) return;
   if (claim.delay) return publish(claim.delay);
   let sendError = null;
@@ -104,7 +105,10 @@ async function deliver(helpers) {
       subject: helpers.personalize(claim.campaign.subject, claim.recipient),
       text: helpers.composeRecipientText(claim.campaign, claim.recipient),
     });
-  } catch (error) { sendError = error.message; }
+  } catch (error) {
+    sendError = error.message;
+    console.error("mail send failed", { code: error.code || "SMTP_ERROR", responseCode: error.responseCode || null });
+  }
   const delay = await transaction((context) => {
     const campaign = context.data.campaigns.find((item) => item.id === claim.campaign.id);
     const recipient = campaign?.recipients.find((item) => item.claimId === claimId);
@@ -123,6 +127,7 @@ async function deliver(helpers) {
     campaign.nextSendAt = new Date(Date.now() + wait).toISOString();
     return Math.ceil(wait / 1000);
   });
+  console.info("mail worker persisted result", { campaignId: claim.campaign.id, result: sendError ? "failed" : "sent" });
   if (delay !== null) await publish(delay);
 }
 
