@@ -175,12 +175,7 @@ let workerTimer = null;
 let workerBusy = false;
 function clearWorkerTimer() { if (workerTimer) clearTimeout(workerTimer); workerTimer = null; }
 function scheduleWorker(delayMs = 0) {
-  if (cloud.enabled) {
-    const campaign = database.campaigns.find((item) => item.status === "running");
-    if (campaign) { campaign.queueWakeAt = new Date().toISOString(); saveDatabase(); }
-    cloud.schedule(delayMs);
-    return;
-  }
+  if (cloud.enabled) { cloud.schedule(delayMs); return; }
   clearWorkerTimer();
   workerTimer = setTimeout(() => { workerTimer = null; runQueue().catch((error) => console.error("Queue error:", error)); }, Math.max(delayMs, 0));
 }
@@ -270,7 +265,7 @@ app.use(express.static(path.join(__dirname, "public")));
 if (cloud.enabled) app.use(cloud.middleware);
 app.get("/api/health", async (request, response) => {
   if (cloud.enabled && request.query.probe === "true") await cloud.probe();
-  const queueProbe = cloud.enabled && request.query.queue === "true" ? await cloud.queueProbe() : null;
+  const queueProbe = cloud.enabled && request.query.queue === "true" ? await cloud.queueProbe(request.query.wake === "true") : null;
   if (request.query.smtp === "true") {
     try { await getTransporter().verify(); }
     catch (error) { return response.status(503).json({ ok: false, storage: "connected", smtp: "unavailable", code: error.code || "SMTP_ERROR" }); }
@@ -457,18 +452,6 @@ app.post("/api/campaigns/:id/resume", (request, response) => {
 });
 
 app.get("/api/dashboard", (_request, response) => {
-  if (cloud.enabled) {
-    const active = database.campaigns.find((campaign) => campaign.status === "running");
-    if (active) {
-      const hasQueued = active.recipients.some((recipient) => recipient.status === "queued");
-      const hasSending = active.recipients.some((recipient) => recipient.status === "sending");
-      const nextSendAt = Date.parse(active.nextSendAt || "");
-      const lastWakeAt = Date.parse(active.queueWakeAt || "");
-      const due = !Number.isFinite(nextSendAt) || nextSendAt <= Date.now();
-      const wakeStale = !Number.isFinite(lastWakeAt) || Date.now() - lastWakeAt >= 60_000;
-      if (hasQueued && !hasSending && due && wakeStale) scheduleWorker(0);
-    }
-  }
   const campaigns = database.campaigns.map(campaignSummary);
   const rows = database.campaigns.flatMap((campaign) => campaign.recipients.map((recipient) => {
     const events = database.events.filter((event) => event.token === recipient.token), has = (type) => events.some((event) => event.type === type);

@@ -5,7 +5,7 @@ module.exports = cloud.queue.handleNodeCallback(async (message) => {
   if (message?.probe === true) {
     await cloud.recordQueueProbe();
     console.info("mail queue probe processed");
-    return;
+    if (message.wake !== true) return;
   }
   console.info("mail queue wake received");
   return cloud.deliver(queueHelpers);

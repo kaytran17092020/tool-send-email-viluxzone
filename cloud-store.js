@@ -135,10 +135,10 @@ async function probe() {
   } finally { await del(uploaded.url); }
 }
 
-async function queueProbe() {
+async function queueProbe(wake = false) {
   const result = await get("health/queue.json", { access: "private", useCache: false });
   const previous = result ? await new Response(result.stream).json() : null;
-  await queue.send(topic, { probe: true }, { idempotencyKey: crypto.randomUUID() });
+  await queue.send(topic, { probe: true, wake }, { idempotencyKey: crypto.randomUUID() });
   return previous;
 }
 
