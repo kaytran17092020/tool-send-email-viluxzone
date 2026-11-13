@@ -261,11 +261,12 @@ app.use(express.static(path.join(__dirname, "public")));
 if (cloud.enabled) app.use(cloud.middleware);
 app.get("/api/health", async (request, response) => {
   if (cloud.enabled && request.query.probe === "true") await cloud.probe();
+  const queueProbe = cloud.enabled && request.query.queue === "true" ? await cloud.queueProbe() : null;
   if (request.query.smtp === "true") {
     try { await getTransporter().verify(); }
     catch (error) { return response.status(503).json({ ok: false, storage: "connected", smtp: "unavailable", code: error.code || "SMTP_ERROR" }); }
   }
-  response.json({ ok: true, storage: cloud.enabled ? "private-blob" : "local", smtp: request.query.smtp === "true" ? "verified" : "not-tested" });
+  response.json({ ok: true, storage: cloud.enabled ? "private-blob" : "local", smtp: request.query.smtp === "true" ? "verified" : "not-tested", queueProbe });
 });
 app.get("/api/settings", (request, response) => response.json({
   trackerBaseUrl: getPublicBaseUrl(request), trackerIsPublic: Boolean(process.env.TRACKER_PUBLIC_URL) && (!cloud.enabled || process.env.TRACKER_PUBLIC_ACCESS === "true"), googleMeasurementId: process.env.GA4_MEASUREMENT_ID || "G-029PNZ8EV2",

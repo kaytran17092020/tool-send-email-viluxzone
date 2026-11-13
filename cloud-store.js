@@ -132,4 +132,17 @@ async function probe() {
   } finally { await del(uploaded.url); }
 }
 
-module.exports = { enabled, current, dirty, schedule, middleware, deliver, queue, probe };
+async function queueProbe() {
+  const result = await get("health/queue.json", { access: "private", useCache: false });
+  const previous = result ? await new Response(result.stream).json() : null;
+  await queue.send(topic, { probe: true }, { idempotencyKey: crypto.randomUUID() });
+  return previous;
+}
+
+async function recordQueueProbe() {
+  await put("health/queue.json", JSON.stringify({ processedAt: new Date().toISOString() }), {
+    access: "private", addRandomSuffix: false, allowOverwrite: true, contentType: "application/json", cacheControlMaxAge: 60,
+  });
+}
+
+module.exports = { enabled, current, dirty, schedule, middleware, deliver, queue, probe, queueProbe, recordQueueProbe };
