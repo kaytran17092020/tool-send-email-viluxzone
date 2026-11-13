@@ -128,17 +128,88 @@ function addUtmParameters(rawUrl, campaign, recipient) {
   } catch { return rawUrl; }
 }
 function trackedUrl(rawUrl, campaign, recipient, baseUrl) { return `${baseUrl}/r/${encodeURIComponent(recipient.token)}?url=${encodeURIComponent(addUtmParameters(rawUrl, campaign, recipient))}`; }
-function replaceLinks(content, campaign, recipient, baseUrl) { return content.replace(/https?:\/\/[^\s<>\")]+/gi, (url) => trackedUrl(url, campaign, recipient, baseUrl)); }
 function personalize(content, recipient) { return content.replace(/{{\s*name\s*}}/gi, recipient.name || "there").replace(/{{\s*email\s*}}/gi, recipient.email).replace(/{{\s*group\s*}}/gi, recipient.group || ""); }
 function escapeHtml(value) { return String(value ?? "").replace(/[&<>\"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[character]); }
+function decodeHtmlEntities(value) {
+  return String(value ?? "").replace(/&(?:amp|lt|gt|quot|apos|nbsp|copy|reg|trade|ndash|mdash|rsquo|lsquo|rdquo|ldquo);|&#(?:x([\da-f]{1,6})|(\d+));/gi, (match, hex, decimal) => {
+    const named = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&apos;": "'", "&nbsp;": " ", "&copy;": "©", "&reg;": "®", "&trade;": "™", "&ndash;": "–", "&mdash;": "—", "&rsquo;": "’", "&lsquo;": "‘", "&rdquo;": "”", "&ldquo;": "“" };
+    if (Object.hasOwn(named, match.toLowerCase())) return named[match.toLowerCase()];
+    const code = hex ? Number.parseInt(hex, 16) : Number(decimal);
+    return code <= 0x10ffff ? String.fromCodePoint(code) : match;
+  });
+}
 function htmlToText(html) {
-  return String(html ?? "").replace(/<!--[\s\S]*?-->/g, " ").replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
-    .replace(/<\/(p|div|h[1-6]|li|tr|blockquote)\s*>/gi, "\n\n").replace(/<br\s*\/?\s*>/gi, "\n")
-    .replace(/<[^>]+>/g, " ").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '\"').replace(/&#39;|&apos;/gi, "'").replace(/&#(\d+);/g, (match, code) => { const value = Number(code); return value <= 0x10ffff ? String.fromCodePoint(value) : match; })
+  return decodeHtmlEntities(String(html ?? "").replace(/<!--[\s\S]*?-->/g, " ").replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<\/(p|div|h[1-6]|li|tr|blockquote)\s*>/gi, "\n\n").replace(/<br\s*\/?\s*>/gi, "\n").replace(/<[^>]+>/g, " "))
     .replace(/[ \t]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
-function campaignPlainText(body) { return cleanText(body.plainText) || htmlToText(body.htmlBody || body.htmlPreview || ""); }
+function looksLikeHtml(value) { return /<\s*(?:!doctype|html|body|div|table|p|a|span|br|h[1-6])\b/i.test(String(value || "")); }
+function campaignHtmlSource(campaign) {
+  const htmlBody = String(campaign.htmlBody || campaign.htmlPreview || "").trim();
+  if (htmlBody) return htmlBody;
+  return looksLikeHtml(campaign.plainText) ? campaign.plainText : plainTextToHtml(campaign.plainText, campaign);
+}
+function campaignPlainText(body) {
+  const plainText = cleanText(body.plainText);
+  if (plainText && !looksLikeHtml(plainText)) return decodeHtmlEntities(plainText);
+  return htmlToText(plainText || body.htmlBody || body.htmlPreview || "");
+}
+function hideUrlsFromText(text) {
+  return String(text || "").replace(/https?:\/\/[^\s<>"']+/gi, (url, offset, source) => {
+    const lineStart = source.lastIndexOf("\n", offset) + 1;
+    const lineEnd = source.indexOf("\n", offset);
+    const line = source.slice(lineStart, lineEnd < 0 ? source.length : lineEnd);
+    return friendlyLinkLabel(url.replace(/[),.;!?]+$/, ""), line);
+  });
+}
+function friendlyLinkLabel(url, line = "") {
+  let host = "";
+  try { host = new URL(url).hostname.replace(/^www\./i, "").toLowerCase(); } catch {}
+  if (/facebook/i.test(line) || host.includes("facebook.com")) return "Viluxzone Official";
+  if (/collection|browse|shop|product/i.test(line) || /\/collections?\/|\/products?\//i.test(url)) return "Explore the collection";
+  if (/official website|website/i.test(line) || host.includes("viluxzone.com")) return "Viluxzone.com";
+  return "Visit website";
+}
+function plainTextToHtml(text, campaign = {}) {
+  const content = decodeHtmlEntities(String(text || "").replace(/{{\s*collection_url\s*}}/gi, campaign.collectionUrl || "")).trim();
+  const paragraphs = content.split(/\n\s*\n/).map((part) => part.trim()).filter(Boolean);
+  const blocks = paragraphs.map((paragraph) => {
+    const lines = paragraph.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const rendered = lines.map((line) => {
+      const urlPattern = /https?:\/\/[^\s<>"]+/gi;
+      const onlyUrl = line.match(/^https?:\/\/[^\s<>"]+$/i);
+      if (onlyUrl) {
+        const destination = safeDestination(onlyUrl[0]);
+        return destination ? `<a href="${escapeHtml(destination)}" style="color:#526579;text-decoration:underline">${escapeHtml(friendlyLinkLabel(destination, paragraph))}</a>` : "";
+      }
+      const escaped = escapeHtml(line).replace(urlPattern, (rawUrl) => {
+        const cleanUrl = rawUrl.replace(/[),.;!?]+$/, "");
+        const destination = safeDestination(cleanUrl);
+        if (!destination) return "";
+        const suffix = rawUrl.slice(cleanUrl.length);
+        return `<a href="${escapeHtml(destination)}" style="color:#526579;text-decoration:underline">${escapeHtml(friendlyLinkLabel(destination, line))}</a>${escapeHtml(suffix)}`;
+      });
+      return escaped;
+    });
+    const joined = rendered.join("<br>");
+    if (/^\s*(?:👉\s*)?(?:explore|browse|shop)\b/i.test(lines[0]) || /^\s*👉/.test(lines[0])) {
+      const firstUrl = paragraph.match(/https?:\/\/[^\s<>"]+/i)?.[0];
+      const destination = safeDestination(firstUrl || campaign.collectionUrl || "");
+      const label = lines[0].replace(/^\s*👉\s*/, "").replace(/https?:\/\/[^\s<>"]+/gi, "").replace(/[.:\s]+$/, "") || "Explore the collection";
+      return `<p style="margin:24px 0;text-align:center"><a href="${escapeHtml(destination || "#")}" style="display:inline-block;padding:13px 22px;border-radius:5px;background:#102a43;color:#ffffff;text-decoration:none;font-weight:bold">${escapeHtml(label)}</a></p>`;
+    }
+    if (/^20%\s*off\b/i.test(lines[0])) return `<p style="margin:18px 0;font-size:16px"><strong style="color:#d9534f">${joined.replace(/^20%\s*OFF/i, "20% OFF")}</strong></p>`;
+    if (/^your code\s*:/i.test(lines[0])) {
+      const codeLine = lines.map((line) => escapeHtml(line).replace(/^(your code\s*:)/i, '<strong>Your Code:</strong> ').replace(/(XMAS\d+|[A-Z][A-Z0-9_-]{3,})\s*$/i, '<span style="display:inline-block;padding:2px 8px;border-radius:4px;background:#f1f3f5;color:#d9534f;font-weight:bold">$1</span>'));
+      return `<p style="margin:14px 0">${codeLine.join("<br>")}</p>`;
+    }
+    if (/^(official website|facebook official)\s*:/i.test(lines[0])) return `<p style="margin:5px 0;color:#6b7280;font-size:13px">${joined}</p>`;
+    if (/^20\d\d\s+(?:©|&copy;)/i.test(lines[0])) return `<p style="margin:5px 0;color:#6b7280;font-size:13px">${joined.replace(/&amp;copy;/gi, "©")}</p>`;
+    if (/^gear up\b/i.test(lines[0])) return `<p style="margin:18px 0;color:#536273"><em>${joined}</em></p>`;
+    return `<p style="margin:0 0 16px">${joined}</p>`;
+  }).join("");
+  return `<!doctype html><html><body style="margin:0;padding:0;background:#f3f5f7;font-family:Arial,Helvetica,sans-serif;color:#263445"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f3f5f7"><tr><td align="center" style="padding:24px 12px"><table role="presentation" width="600" cellspacing="0" cellpadding="0" style="width:100%;max-width:600px;background:#ffffff;border:1px solid #e5e7eb;border-radius:8px"><tr><td style="padding:34px 38px;font-size:15px;line-height:1.7">${blocks}</td></tr></table></td></tr></table></body></html>`;
+}
 function personalizeHtml(content, campaign, recipient) {
   let html = String(content || "").slice(0, 500_000)
     .replace(/<\s*(script|iframe|object|embed)\b[^>]*>[\s\S]*?<\/\s*\1\s*>/gi, "")
@@ -148,17 +219,20 @@ function personalizeHtml(content, campaign, recipient) {
     .replace(/{{\s*name\s*}}/gi, escapeHtml(recipient.name || "there"))
     .replace(/{{\s*email\s*}}/gi, escapeHtml(recipient.email))
     .replace(/{{\s*group\s*}}/gi, escapeHtml(recipient.group || ""));
-  return html.replace(/<a\b([^>]*?)\bhref\s*=\s*(["'])(.*?)\2([^>]*)>/gi, (match, before, quote, encodedUrl, after) => {
+  return html.replace(/<a\b([^>]*?)\bhref\s*=\s*(["'])(.*?)\2([^>]*)>([\s\S]*?)<\/a\s*>/gi, (match, before, quote, encodedUrl, after, labelHtml) => {
     const destination = safeDestination(encodedUrl.replace(/&amp;/gi, "&").replace(/&#0*38;/gi, "&"));
     if (!destination) return match;
-    return `<a${before}href=${quote}${escapeHtml(trackedUrl(destination, campaign, recipient, campaign.trackerBaseUrl))}${quote}${after}>`;
+    const visibleLabel = htmlToText(labelHtml).trim();
+    const friendlyLabel = /^https?:\/\//i.test(visibleLabel) ? escapeHtml(friendlyLinkLabel(destination, visibleLabel)) : labelHtml;
+    return `<a${before}href=${quote}${escapeHtml(trackedUrl(destination, campaign, recipient, campaign.trackerBaseUrl))}${quote}${after}>${friendlyLabel}</a>`;
   });
 }
 function composeRecipientText(campaign, recipient) {
-  const withCollection = campaign.plainText.replace(/{{\s*collection_url\s*}}/gi, campaign.collectionUrl || "");
-  const body = personalize(withCollection, recipient);
+  const source = campaignPlainText(campaign);
+  const withCollection = source.replace(/{{\s*collection_url\s*}}/gi, campaign.collectionUrl || "");
+  const body = hideUrlsFromText(personalize(withCollection, recipient));
   const greeting = campaign.addGreeting && recipient.name ? `Dear ${recipient.name},\n\n` : "";
-  return replaceLinks(`${greeting}${body}`, campaign, recipient, campaign.trackerBaseUrl);
+  return `${greeting}${body}`;
 }
 function safeDestination(value) { try { const url = new URL(value); return ["http:", "https:"].includes(url.protocol) ? url.toString() : null; } catch { return null; } }
 function getSmtpConfig(encrypted) { return smtpSettings.decrypt(encrypted || cloud.current()?.smtp) || smtpSettings.environment(); }
@@ -229,7 +303,7 @@ async function runQueue() {
       to: recipient.email,
       subject: personalize(campaign.subject, recipient),
       text: composeRecipientText(campaign, recipient),
-      ...(campaign.htmlBody ? { html: personalizeHtml(campaign.htmlBody, campaign, recipient) } : {}),
+      html: personalizeHtml(campaignHtmlSource(campaign), campaign, recipient),
     });
     recipient.status = "sent";
     recipient.sentAt = new Date().toISOString();
