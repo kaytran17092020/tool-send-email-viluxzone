@@ -139,6 +139,7 @@ function safeDestination(value) { try { const url = new URL(value); return ["htt
 function getTransporter() {
   const host = cleanText(process.env.SMTP_HOST), user = cleanText(process.env.SMTP_USER), password = cleanText(process.env.SMTP_PASS);
   if (!host || !user || !password) throw new Error("Thiếu SMTP_HOST, SMTP_USER hoặc SMTP_PASS trong file .env.");
+  if (/your-domain|replace-with/i.test(`${user} ${password}`)) throw new Error("SMTP vẫn dùng thông tin mẫu. Hãy điền biến môi trường SMTP hợp lệ.");
   return nodemailer.createTransport({ host, port: Number(process.env.SMTP_PORT || 465), secure: cleanText(process.env.SMTP_SECURE || "true").toLowerCase() !== "false", auth: { user, pass: password } });
 }
 function recipientPayload() {
@@ -258,8 +259,16 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, "public")));
 if (cloud.enabled) app.use(cloud.middleware);
+app.get("/api/health", async (request, response) => {
+  if (cloud.enabled && request.query.probe === "true") await cloud.probe();
+  if (request.query.smtp === "true") {
+    try { await getTransporter().verify(); }
+    catch (error) { return response.status(503).json({ ok: false, storage: "connected", smtp: "unavailable", code: error.code || "SMTP_ERROR" }); }
+  }
+  response.json({ ok: true, storage: cloud.enabled ? "private-blob" : "local", smtp: request.query.smtp === "true" ? "verified" : "not-tested" });
+});
 app.get("/api/settings", (request, response) => response.json({
-  trackerBaseUrl: getPublicBaseUrl(request), trackerIsPublic: Boolean(process.env.TRACKER_PUBLIC_URL), googleMeasurementId: process.env.GA4_MEASUREMENT_ID || "G-029PNZ8EV2",
+  trackerBaseUrl: getPublicBaseUrl(request), trackerIsPublic: Boolean(process.env.TRACKER_PUBLIC_URL) && (!cloud.enabled || process.env.TRACKER_PUBLIC_ACCESS === "true"), googleMeasurementId: process.env.GA4_MEASUREMENT_ID || "G-029PNZ8EV2",
   smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && !/your-domain|replace-with/i.test(`${process.env.SMTP_USER} ${process.env.SMTP_PASS}`)), from: process.env.SMTP_FROM || process.env.SMTP_USER || "",
   defaultRecipientFileConfigured: Boolean(defaultRecipientFile), defaultRecipientFileName: defaultRecipientFile ? path.basename(defaultRecipientFile) : "", delayMinMinutes: sendDelayMinMs / 60_000, delayMaxMinutes: sendDelayMaxMs / 60_000,
 }));

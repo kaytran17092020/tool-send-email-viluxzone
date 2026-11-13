@@ -1,6 +1,6 @@
 const { AsyncLocalStorage } = require("node:async_hooks");
 const crypto = require("node:crypto");
-const { get, put } = require("@vercel/blob");
+const { get, put, del } = require("@vercel/blob");
 const { QueueClient } = require("@vercel/queue");
 
 const enabled = Boolean(process.env.VERCEL);
@@ -123,4 +123,13 @@ async function deliver(helpers) {
   if (delay !== null) await publish(delay);
 }
 
-module.exports = { enabled, current, dirty, schedule, middleware, deliver, queue };
+async function probe() {
+  const pathname = `health/${crypto.randomUUID()}.json`;
+  const uploaded = await put(pathname, '{"ok":true}', { access: "private", addRandomSuffix: false });
+  try {
+    const result = await get(uploaded.url, { access: "private", useCache: false });
+    if (!result || !(await new Response(result.stream).json()).ok) throw new Error("Storage probe failed");
+  } finally { await del(uploaded.url); }
+}
+
+module.exports = { enabled, current, dirty, schedule, middleware, deliver, queue, probe };
