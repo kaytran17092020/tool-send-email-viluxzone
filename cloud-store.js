@@ -9,11 +9,17 @@ const queue = new QueueClient({ region: "sin1" });
 const statePath = "nodemail/state.json";
 const topic = "nodemail-send";
 
-async function load() {
+async function load(verifyEtag = false) {
   const result = await get(statePath, { access: "private", useCache: false });
   if (!result) return { data: { recipients: [], campaigns: [], events: [] }, history: {}, teamContent: {}, etag: null, dirty: false, wake: null };
   const state = JSON.parse(await new Response(result.stream).text());
-  return { ...state, etag: result.blob.etag, dirty: false, wake: null };
+  let etag = result.blob.etag;
+  if (verifyEtag) {
+    const current = await head(statePath, { access: "private" });
+    if (!current || current.etag !== etag) throw new Error("Vercel Blob state changed during read.");
+    etag = current.etag;
+  }
+  return { ...state, etag, dirty: false, wake: null };
 }
 
 async function save(context) {
@@ -61,7 +67,13 @@ function middleware(request, response, next) {
 async function transaction(update) {
   let lastConflict = null;
   for (let attempt = 0; attempt < 12; attempt += 1) {
-    const context = await load();
+    let context;
+    try { context = await load(true); } catch (error) {
+      if (!/state changed during read/i.test(error.message)) throw error;
+      lastConflict = error;
+      if (attempt < 11) await new Promise((resolve) => setTimeout(resolve, 25 + Math.floor(Math.random() * (25 * (attempt + 1)))));
+      continue;
+    }
     const value = update(context);
     try { await save(context); return value; } catch (error) {
       const conflict = error.name === "BlobPreconditionFailedError" || error.status === 412 || error.statusCode === 412 || /already exists|precondition failed|etag mismatch/i.test(error.message);
