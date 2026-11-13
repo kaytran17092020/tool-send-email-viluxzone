@@ -11,7 +11,7 @@
     "api/index.js": { "maxDuration": 60 },
     "api/mail-worker.js": {
       "maxDuration": 60,
-      "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "nodemail-send-v2", "maxConcurrency": 1 }]
+      "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "nodemail-send-v3", "maxConcurrency": 1 }]
     }
   }
 }

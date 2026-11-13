@@ -7,7 +7,7 @@ const enabled = Boolean(process.env.VERCEL);
 const contexts = new AsyncLocalStorage();
 const queue = new QueueClient({ region: "sin1" });
 const statePath = "nodemail/state.json";
-const topic = "nodemail-send-v2";
+const topic = "nodemail-send-v3";
 
 async function load() {
   const result = await get(statePath, { access: "private", useCache: false });
