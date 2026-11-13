@@ -9,8 +9,22 @@ function defaultTeamMessage(group) {
   const label = group || "football";
   return {
     subject: `A fresh look for ${label} fans`,
-    plainText: `We’ve put together a fresh Viluxzone collection inspired by ${label} colours and matchday spirit.\n\nBrowse the collection here:\n{{collection_url}}\n\nThanks for being part of the Viluxzone community.\n\nBest regards,\nViluxzone Team.`,
-    htmlPreview: "",
+    htmlBody: `<div style="margin:0 auto;max-width:600px;padding:32px 24px;font-family:Arial,Helvetica,sans-serif;color:#202a36;line-height:1.65;background:#ffffff">
+  <p style="margin:0 0 18px;color:#697586;font-size:13px;letter-spacing:1.5px;text-transform:uppercase">VILUXZONE · MATCHDAY EDIT</p>
+  <p style="margin:0 0 18px">Dear {{name}},</p>
+  <h1 style="margin:0 0 14px;font-family:Georgia,serif;font-size:30px;line-height:1.2;color:#102a43">A fresh look for ${label} fans</h1>
+  <p style="margin:0 0 18px;color:#536273">Celebrate your colours with a considered edit of new ${label} inspired styles, made for matchday and every day after.</p>
+  <div style="margin:24px 0;padding:18px 20px;background:#f3f6fa;border-left:4px solid #c49a54">
+    <p style="margin:0 0 4px;font-size:12px;letter-spacing:1px;color:#697586;text-transform:uppercase">A little thank-you</p>
+    <p style="margin:0;font-family:Georgia,serif;font-size:25px;color:#102a43"><strong>20% off</strong> your next order</p>
+    <p style="margin:6px 0 0;color:#536273">Use code <strong style="color:#102a43">MATCHDAY20</strong> at checkout.</p>
+  </div>
+  <p style="margin:26px 0;text-align:center"><a href="{{collection_url}}" style="display:inline-block;padding:13px 22px;border-radius:5px;background:#102a43;color:#ffffff;text-decoration:none;font-weight:bold">Explore the collection&nbsp; →</a></p>
+  <p style="margin:0 0 20px;color:#536273">Thanks for being part of the Viluxzone community. We hope you find something you love.</p>
+  <p style="margin:0">Best regards,<br><strong>Viluxzone Support</strong></p>
+  <hr style="margin:26px 0;border:0;border-top:1px solid #e6e9ed">
+  <p style="margin:0;color:#788392;font-size:12px">Official website: <a href="https://www.viluxzone.com" style="color:#536273;text-decoration:underline">Viluxzone.com</a><br>Facebook: <a href="https://www.facebook.com/viluxzone.official" style="color:#536273;text-decoration:underline">Viluxzone Official</a><br>© 2026 Viluxzone</p>
+</div>`,
     collectionUrl: state.collections[group] || "",
   };
 }
@@ -44,7 +58,14 @@ function updateSelection() {
   $("#exportTeamButton").disabled = !selectedGroups().length;
   if ($("#teamSelector").value !== (selectedGroups()[0] || "")) $("#teamSelector").value = selectedGroups()[0] || "";
 }
-function refreshHtmlPreview() { $("#htmlFrame").srcdoc = $("#htmlPreview").value || "<p style='font-family:Arial;color:#6b7280'>Bản xem trước HTML xuất hiện ở đây.</p>"; }
+function refreshHtmlPreview() {
+  let source = $("#htmlBody").value.trim();
+  const sampleUrl = $("#collectionUrl").value.trim() || "https://www.viluxzone.com/collections/your-team";
+  source = source.replace(/{{\s*name\s*}}/gi, "Kopite").replace(/{{\s*email\s*}}/gi, "kopite@example.com").replace(/{{\s*group\s*}}/gi, $("#teamSelector").value || "Your team").replace(/{{\s*collection_url\s*}}/gi, sampleUrl);
+  if (!source) source = `<div style="padding:36px;color:#64748b;font:14px Arial,sans-serif">Dán HTML email vào khung bên trái để xem trước.</div>`;
+  const frame = $("#htmlFrame"), previewCss = `<style>html{background:#eef2f6}body{box-sizing:border-box;width:min(100%,680px);min-height:100vh;margin:0 auto;padding:32px 24px;background:#fff;font-family:Arial,Helvetica,sans-serif;color:#202a36;line-height:1.6;overflow-wrap:anywhere}img{max-width:100%;height:auto}a{overflow-wrap:anywhere}</style>`;
+  frame.srcdoc = /<html\b/i.test(source) ? source.replace(/<\/head\s*>/i, `${previewCss}</head>`) : `<!doctype html><html><head><meta charset="utf-8">${previewCss}</head><body>${source}</body></html>`;
+}
 function formatTime(value) { return value ? new Date(value).toLocaleString("vi-VN") : "—"; }
 async function loadSettings() {
   state.settings = await request("/api/settings");
@@ -66,10 +87,9 @@ function updateCollectionPicker() {
 async function loadTeamContent(group) {
   if (!group) return;
   const stored = await request(`/api/team-content?group=${encodeURIComponent(group)}`);
-  const values = stored.subject || stored.plainText ? stored : defaultTeamMessage(group);
+  const values = stored.subject || stored.plainText || stored.htmlBody || stored.htmlPreview ? stored : defaultTeamMessage(group);
   $("#subject").value = values.subject || "";
-  $("#plainText").value = values.plainText || "";
-  $("#htmlPreview").value = values.htmlPreview || "";
+  $("#htmlBody").value = values.htmlBody || values.htmlPreview || "";
   $("#collectionUrl").value = values.collectionUrl || state.collections[group] || "";
   updateCollectionPicker();
   $("#collectionUrl").value = values.collectionUrl || state.collections[group] || "";
@@ -80,7 +100,7 @@ async function loadTeamContent(group) {
 async function saveTeamContent(groupOverride = "") {
   const group = groupOverride || $("#teamSelector").value || selectedGroups()[0];
   if (!group) return showToast("Chọn đội để lưu nội dung riêng.", "error");
-  const response = await request("/api/team-content", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group, subject: $("#subject").value, plainText: $("#plainText").value, htmlPreview: $("#htmlPreview").value, collectionUrl: $("#collectionUrl").value }) });
+  const response = await request("/api/team-content", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ group, subject: $("#subject").value, htmlBody: $("#htmlBody").value, collectionUrl: $("#collectionUrl").value }) });
   const team = state.teams.find((item) => item.group === group); if (team) team.contentSaved = true;
   state.activeTeam = group; state.contentDirty = false;
   $("#contentSaveStatus").textContent = `Đã lưu file riêng ${teamFileName(group)} · ${formatTime(response.updatedAt)}`;
@@ -103,12 +123,12 @@ function renderQueueStatus() {
 }
 async function controlCampaign(id, action) { try { const result = await request(`/api/campaigns/${id}/${action}`, { method: "POST" }); showToast(action === "pause" ? "Đã pause. Lịch sử và hàng chờ đã được lưu." : "Đã tiếp tục gửi chiến dịch.", "success"); await loadDashboard(); renderQueueStatus(); } catch (error) { showToast(error.message, "error"); } }
 async function queueCampaign() {
-  const groups = selectedGroups(), subject = $("#subject").value.trim(), plainText = $("#plainText").value.trim();
+  const groups = selectedGroups(), subject = $("#subject").value.trim(), htmlBody = $("#htmlBody").value.trim();
   const manualEmails = manualAddresses();
-  if (!subject || !plainText || (!groups.length && !manualEmails.length)) return showToast("Chọn một đội hoặc nhập danh sách email, đồng thời điền tiêu đề và nội dung.", "error");
+  if (!subject || !htmlBody || (!groups.length && !manualEmails.length)) return showToast("Chọn một đội hoặc nhập danh sách email, đồng thời điền tiêu đề và nội dung HTML.", "error");
   if (groups.length > 1) return showToast("Mỗi lượt chỉ chọn một đội để tránh dùng nhầm nội dung của CLB khác.", "error");
   const button = $("#sendButton"); button.disabled = true; button.textContent = "Đang kiểm tra lịch sử…";
-  const payload = { subject, plainText, htmlPreview: $("#htmlPreview").value, utmCampaign: $("#utmCampaign").value, addGreeting: $("#addGreeting").checked, groups, manualEmails: manualEmails.join("\n"), collectionUrl: $("#collectionUrl").value, funnel: $("#funnel").value };
+  const payload = { subject, htmlBody, utmCampaign: $("#utmCampaign").value, addGreeting: false, groups, manualEmails: manualEmails.join("\n"), collectionUrl: $("#collectionUrl").value, funnel: $("#funnel").value };
   try {
     const preview = await request("/api/campaigns/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     let allowDuplicates = false;
@@ -141,13 +161,13 @@ document.querySelectorAll(".tab").forEach((button) => button.addEventListener("c
 $("#fileInput").addEventListener("change", async (event) => { if (event.target.files[0]) try { await importRecipients(event.target.files[0]); } catch (error) { $("#importMessage").textContent = error.message; } finally { event.target.value = ""; } });
 $("#teamFileInput").addEventListener("change", async (event) => { const group = $("#teamFileGroup").value; if (!group) { showToast("Chọn đội trước khi nhập file riêng.", "error"); event.target.value = ""; return; } if (event.target.files[0]) try { await importRecipients(event.target.files[0], group); } catch (error) { $("#importMessage").textContent = error.message; } finally { event.target.value = ""; } });
 $("#manualTxtInput").addEventListener("change", async (event) => { const file = event.target.files[0]; if (file) { $("#manualEmails").value = await file.text(); updateSelection(); } event.target.value = ""; });
-$("#importSourceButton").addEventListener("click", importDefaultSource); $("#htmlPreview").addEventListener("input", refreshHtmlPreview); $("#sendButton").addEventListener("click", queueCampaign); $("#refreshDashboard").addEventListener("click", () => loadDashboard().then(() => showToast("Đã làm mới dữ liệu.", "success")).catch((error) => showToast(error.message, "error"))); $("#campaignFilter").addEventListener("change", renderTrackingRows);
-$("#teamSelector").addEventListener("change", async () => { const group = $("#teamSelector").value, previousTeam = state.activeTeam; if (state.contentDirty && previousTeam && previousTeam !== group) await saveTeamContent(previousTeam).catch((error) => showToast(error.message, "error")); document.querySelectorAll(".group-check").forEach((input) => { input.checked = input.value === group; }); updateSelection(); updateCollectionPicker(); if (group) try { await loadTeamContent(group); } catch (error) { showToast(error.message, "error"); } else { state.activeTeam = ""; state.contentDirty = false; $("#subject").value = ""; $("#plainText").value = ""; $("#htmlPreview").value = ""; $("#collectionUrl").value = ""; refreshHtmlPreview(); $("#contentSaveStatus").textContent = "Danh sách nhập tay: hãy tự nhập tiêu đề và nội dung email."; } });
+$("#importSourceButton").addEventListener("click", importDefaultSource); $("#htmlBody").addEventListener("input", () => { refreshHtmlPreview(); markTeamContentDirty(); }); $("#sendButton").addEventListener("click", queueCampaign); $("#refreshDashboard").addEventListener("click", () => loadDashboard().then(() => showToast("Đã làm mới dữ liệu.", "success")).catch((error) => showToast(error.message, "error"))); $("#campaignFilter").addEventListener("change", renderTrackingRows);
+$("#teamSelector").addEventListener("change", async () => { const group = $("#teamSelector").value, previousTeam = state.activeTeam; if (state.contentDirty && previousTeam && previousTeam !== group) await saveTeamContent(previousTeam).catch((error) => showToast(error.message, "error")); document.querySelectorAll(".group-check").forEach((input) => { input.checked = input.value === group; }); updateSelection(); updateCollectionPicker(); if (group) try { await loadTeamContent(group); } catch (error) { showToast(error.message, "error"); } else { state.activeTeam = ""; state.contentDirty = false; $("#subject").value = ""; $("#htmlBody").value = ""; $("#collectionUrl").value = ""; refreshHtmlPreview(); $("#contentSaveStatus").textContent = "Danh sách nhập tay: hãy tự nhập tiêu đề và nội dung HTML."; } });
 $("#collectionPicker").addEventListener("change", () => { $("#collectionUrl").value = $("#collectionPicker").value; markTeamContentDirty(); });
 $("#collectionUrl").addEventListener("input", () => { const url = $("#collectionUrl").value; $("#collectionPicker").value = [...$("#collectionPicker").options].some((option) => option.value === url) ? url : ""; });
 $("#saveTeamContent").addEventListener("click", () => saveTeamContent().catch((error) => showToast(error.message, "error")));
 function markTeamContentDirty() { if (!state.activeTeam) return; state.contentDirty = true; $("#contentSaveStatus").textContent = `Có thay đổi chưa lưu cho ${state.activeTeam}; hệ thống sẽ lưu khi bạn chuyển đội.`; }
-["#subject", "#plainText", "#htmlPreview", "#collectionUrl"].forEach((selector) => $(selector).addEventListener("input", markTeamContentDirty));
+["#subject", "#collectionUrl"].forEach((selector) => $(selector).addEventListener("input", () => { refreshHtmlPreview(); markTeamContentDirty(); }));
 $("#manualEmails").addEventListener("input", updateSelection);
 $("#exportTeamButton").addEventListener("click", () => { const group = selectedGroups()[0]; if (group) location.href = `/api/teams/export?group=${encodeURIComponent(group)}`; });
 $("#clearRecipients").addEventListener("click", async () => { if (state.recipients.length && confirm("Xóa toàn bộ danh sách người nhận đã nhập? Lịch sử gửi vẫn được giữ.")) { await request("/api/recipients", { method: "DELETE" }); state.teams = []; renderRecipients({ recipients: [], groups: {} }); } });
