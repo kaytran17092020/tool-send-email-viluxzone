@@ -149,6 +149,9 @@ function campaignHtmlSource(campaign) {
   if (htmlBody) return htmlBody;
   return looksLikeHtml(campaign.plainText) ? campaign.plainText : plainTextToHtml(campaign.plainText, campaign);
 }
+function campaignCollectionUrl(campaign) {
+  return safeDestination(cleanText(campaign.collectionUrl)) || safeDestination(CLUB_COLLECTIONS[cleanText(campaign.group)] || "") || "";
+}
 function campaignPlainText(body) {
   const plainText = cleanText(body.plainText);
   if (plainText && !looksLikeHtml(plainText)) return decodeHtmlEntities(plainText);
@@ -194,7 +197,7 @@ function plainTextToHtml(text, campaign = {}) {
     const joined = rendered.join("<br>");
     if (/^\s*(?:👉\s*)?(?:explore|browse|shop)\b/i.test(lines[0]) || /^\s*👉/.test(lines[0])) {
       const firstUrl = paragraph.match(/https?:\/\/[^\s<>"]+/i)?.[0];
-      const destination = safeDestination(firstUrl || campaign.collectionUrl || "");
+      const destination = safeDestination(firstUrl || campaignCollectionUrl(campaign));
       const label = lines[0].replace(/^\s*👉\s*/, "").replace(/https?:\/\/[^\s<>"]+/gi, "").replace(/[.:\s]+$/, "") || "Explore the collection";
       return `<p style="margin:24px 0;text-align:center"><a href="${escapeHtml(destination || "#")}" style="display:inline-block;padding:13px 22px;border-radius:5px;background:#102a43;color:#ffffff;text-decoration:none;font-weight:bold">${escapeHtml(label)}</a></p>`;
     }
@@ -211,20 +214,24 @@ function plainTextToHtml(text, campaign = {}) {
   return `<!doctype html><html><body style="margin:0;padding:0;background:#f3f5f7;font-family:Arial,Helvetica,sans-serif;color:#263445"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f3f5f7"><tr><td align="center" style="padding:24px 12px"><table role="presentation" width="600" cellspacing="0" cellpadding="0" style="width:100%;max-width:600px;background:#ffffff;border:1px solid #e5e7eb;border-radius:8px"><tr><td style="padding:34px 38px;font-size:15px;line-height:1.7">${blocks}</td></tr></table></td></tr></table></body></html>`;
 }
 function personalizeHtml(content, campaign, recipient) {
+  const collectionUrl = campaignCollectionUrl(campaign);
   let html = String(content || "").slice(0, 500_000)
     .replace(/<\s*(script|iframe|object|embed)\b[^>]*>[\s\S]*?<\/\s*\1\s*>/gi, "")
     .replace(/\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
     .replace(/(href|src)\s*=\s*(["'])\s*javascript:[\s\S]*?\2/gi, '$1="#"');
-  html = html.replace(/{{\s*collection_url\s*}}/gi, escapeHtml(campaign.collectionUrl || ""))
+  html = html.replace(/{{\s*collection_url\s*}}/gi, escapeHtml(collectionUrl))
     .replace(/{{\s*name\s*}}/gi, escapeHtml(recipient.name || "there"))
     .replace(/{{\s*email\s*}}/gi, escapeHtml(recipient.email))
     .replace(/{{\s*group\s*}}/gi, escapeHtml(recipient.group || ""));
   return html.replace(/<a\b([^>]*?)\bhref\s*=\s*(["'])(.*?)\2([^>]*)>([\s\S]*?)<\/a\s*>/gi, (match, before, quote, encodedUrl, after, labelHtml) => {
     const destination = safeDestination(encodedUrl.replace(/&amp;/gi, "&").replace(/&#0*38;/gi, "&"));
-    if (!destination) return match;
     const visibleLabel = htmlToText(labelHtml).trim();
-    const friendlyLabel = /^https?:\/\//i.test(visibleLabel) ? escapeHtml(friendlyLinkLabel(destination, visibleLabel)) : labelHtml;
-    return `<a${before}href=${quote}${escapeHtml(trackedUrl(destination, campaign, recipient, campaign.trackerBaseUrl))}${quote}${after}>${friendlyLabel}</a>`;
+    const isCollectionCta = /\b(?:explore|browse|shop)\b[\s\S]{0,120}\bcollection\b/i.test(visibleLabel);
+    const finalDestination = isCollectionCta && collectionUrl ? collectionUrl : destination;
+    if (!finalDestination) return match;
+    const friendlyLabel = /^https?:\/\//i.test(visibleLabel) ? escapeHtml(friendlyLinkLabel(finalDestination, visibleLabel)) : labelHtml;
+    const safeAfter = after.replace(/\s+target\s*=\s*(["'])[^"']*\1/gi, "").replace(/\s+rel\s*=\s*(["'])[^"']*\1/gi, "");
+    return `<a${before}href=${quote}${escapeHtml(trackedUrl(finalDestination, campaign, recipient, campaign.trackerBaseUrl))}${quote}${safeAfter} target="_blank" rel="noopener noreferrer">${friendlyLabel}</a>`;
   });
 }
 function composeRecipientText(campaign, recipient) {
@@ -486,11 +493,12 @@ function inspectCampaignDuplicates(body, recipients) {
 app.post("/api/campaigns/preview", (request, response) => {
   const subject = cleanSubject(request.body.subject), plainText = campaignPlainText(request.body);
   if (!subject || !plainText) return response.status(400).json({ error: "Cần có tiêu đề và nội dung HTML." });
-  const rawCollectionUrl = cleanText(request.body.collectionUrl), collectionUrl = rawCollectionUrl ? safeDestination(rawCollectionUrl) : "";
-  if (rawCollectionUrl && !collectionUrl) return response.status(400).json({ error: "Collection URL cần là liên kết http/https hợp lệ." });
-  if (/{{\s*collection_url\s*}}/i.test(`${plainText}\n${request.body.htmlBody || ""}`) && !collectionUrl) return response.status(400).json({ error: "Nội dung đang có {{collection_url}} nhưng chưa chọn/dán Collection URL." });
   let audience;
   try { audience = campaignRequestedRecipients(request.body, false); } catch (error) { return response.status(400).json({ error: error.message }); }
+  const rawCollectionUrl = cleanText(request.body.collectionUrl), providedCollectionUrl = rawCollectionUrl ? safeDestination(rawCollectionUrl) : "";
+  if (rawCollectionUrl && !providedCollectionUrl) return response.status(400).json({ error: "Collection URL cần là liên kết http/https hợp lệ." });
+  const collectionUrl = providedCollectionUrl || safeDestination(CLUB_COLLECTIONS[audience.selectedGroups[0]] || "") || "";
+  if (/{{\s*collection_url\s*}}/i.test(`${plainText}\n${request.body.htmlBody || ""}`) && !collectionUrl) return response.status(400).json({ error: "Nội dung đang có {{collection_url}} nhưng chưa chọn/dán Collection URL." });
   const duplicates = inspectCampaignDuplicates(request.body, audience.requested).filter((item) => item.isDuplicate);
   response.json({ total: audience.requested.length, manualCount: audience.manualCount, duplicateCount: duplicates.length, duplicates: duplicates.slice(0, 100), duplicateHistory: "Lịch sử cũ được so email + tiêu đề; các lượt gửi mới được so cả nội dung chuẩn hóa." });
 });
@@ -504,8 +512,9 @@ app.post("/api/campaigns/send", async (request, response) => {
   try { audience = campaignRequestedRecipients(request.body, true); } catch (error) { return response.status(400).json({ error: error.message }); }
   const { requested, selectedGroups } = audience;
   if (!requested.length) return response.status(400).json({ error: "Chưa chọn đội hoặc nhóm email." });
-  const collectionUrl = safeDestination(cleanText(request.body.collectionUrl)) || "";
-  if (cleanText(request.body.collectionUrl) && !collectionUrl) return response.status(400).json({ error: "Collection URL cần là liên kết http/https hợp lệ." });
+  const rawCollectionUrl = cleanText(request.body.collectionUrl), providedCollectionUrl = rawCollectionUrl ? safeDestination(rawCollectionUrl) : "";
+  if (rawCollectionUrl && !providedCollectionUrl) return response.status(400).json({ error: "Collection URL cần là liên kết http/https hợp lệ." });
+  const collectionUrl = providedCollectionUrl || safeDestination(CLUB_COLLECTIONS[selectedGroups[0]] || "") || "";
   if (/{{\s*collection_url\s*}}/i.test(`${plainText}\n${htmlBody}`) && !collectionUrl) return response.status(400).json({ error: "Nội dung đang có {{collection_url}} nhưng chưa chọn/dán Collection URL." });
   const duplicateChecks = inspectCampaignDuplicates(request.body, requested);
   const duplicatesByEmail = new Map(duplicateChecks.filter((item) => item.isDuplicate).map((item) => [item.email.toLowerCase(), item]));
