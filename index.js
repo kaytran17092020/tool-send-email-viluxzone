@@ -1,484 +1,1 @@
-require("dotenv").config();
-
-const crypto = require("crypto");
-const fs = require("fs");
-const path = require("path");
-const express = require("express");
-const multer = require("multer");
-const nodemailer = require("nodemailer");
-const XLSX = require("xlsx");
-const { CLUB_COLLECTIONS } = require("./club-data");
-const historyFiles = require("./sent-history");
-const { createHistoryIndex, inspectDuplicate, recordSent } = historyFiles;
-const cloud = require("./cloud-store");
-const smtpSettings = require("./smtp-settings");
-function loadSentHistory(file) { return cloud.current()?.history || historyFiles.loadSentHistory(file); }
-function saveSentHistory(file, history) { if (cloud.current()) { cloud.current().history = history; cloud.dirty(); } else historyFiles.saveSentHistory(file, history); }
-
-const app = express();
-const port = Number(process.env.PORT || 3030);
-const host = process.env.HOST || "127.0.0.1";
-const dataDirectory = process.env.VERCEL ? "/tmp/nodemail" : path.join(__dirname, "data");
-const databaseFile = path.join(dataDirectory, "mail-data.json");
-const teamFilesDirectory = path.join(dataDirectory, "team-files");
-const teamContentDirectory = path.join(dataDirectory, "team-content");
-const sentHistoryFile = path.join(__dirname, "sent_history.json");
-const defaultRecipientSetting = cleanText(process.env.DEFAULT_RECIPIENTS_FILE);
-const defaultRecipientFile = defaultRecipientSetting ? path.resolve(__dirname, defaultRecipientSetting) : "";
-const sendDelayMinMs = Math.max(Number(process.env.SEND_DELAY_MIN_MS || 60_000), 60_000);
-const sendDelayMaxMs = Math.max(Number(process.env.SEND_DELAY_MAX_MS || 120_000), sendDelayMinMs);
-const duplicateWindowMs = 3 * 24 * 60 * 60 * 1000;
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 12 * 1024 * 1024 },
-  fileFilter: (_request, file, done) => {
-    const allowed = /\.(xlsx|csv)$/i.test(file.originalname);
-    done(allowed ? null : new Error("Chá»‰ há»— trá»£ file .xlsx hoáº·c .csv."), allowed);
-  },
-});
-
-fs.mkdirSync(dataDirectory, { recursive: true });
-fs.mkdirSync(teamFilesDirectory, { recursive: true });
-fs.mkdirSync(teamContentDirectory, { recursive: true });
-const newId = (prefix) => `${prefix}_${crypto.randomBytes(10).toString("hex")}`;
-function cleanText(value) { return String(value ?? "").trim(); }
-function looksLikeDateName(value) { const text = cleanText(value); return /^(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b/.test(text); }
-function cleanSubject(value) { return cleanText(value).replace(/[\r\n]+/g, " "); }
-function isEmail(value) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanText(value)); }
-function normalizedHeader(value) { return cleanText(value).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/Ä‘/g, "d").replace(/[^a-z0-9]/g, ""); }
-function columnByPriority(headers, terms) { return headers.find((header) => terms.some((term) => normalizedHeader(header).includes(term))); }
-function randomDelay() { return sendDelayMinMs + Math.floor(Math.random() * (sendDelayMaxMs - sendDelayMinMs + 1)); }
-function contentFingerprint(subject, plainText) { return crypto.createHash("sha256").update(`${cleanSubject(subject)}\n${cleanText(plainText)}`, "utf8").digest("hex"); }
-
-function loadDatabase() {
-  if (!fs.existsSync(databaseFile)) return { recipients: [], campaigns: [], events: [] };
-  try {
-    const stored = JSON.parse(fs.readFileSync(databaseFile, "utf8"));
-    return {
-      recipients: Array.isArray(stored.recipients) ? stored.recipients.map((recipient) => looksLikeDateName(recipient.name) ? { ...recipient, name: "" } : recipient) : [],
-      campaigns: Array.isArray(stored.campaigns) ? stored.campaigns : [],
-      events: Array.isArray(stored.events) ? stored.events : [],
-    };
-  } catch (error) {
-    console.error("KhÃ´ng Ä‘á»c Ä‘Æ°á»£c dá»¯ liá»‡u cÅ©:", error.message);
-    return { recipients: [], campaigns: [], events: [] };
-  }
-}
-const localDatabase = loadDatabase();
-const database = new Proxy(localDatabase, {
-  get(target, key) { return (cloud.current()?.data || target)[key]; },
-  set(target, key, value) { (cloud.current()?.data || target)[key] = value; return true; },
-});
-function saveDatabase() {
-  if (cloud.current()) { cloud.dirty(); return; }
-  const temporaryFile = `${databaseFile}.tmp`;
-  fs.writeFileSync(temporaryFile, JSON.stringify(database, null, 2), "utf8");
-  fs.renameSync(temporaryFile, databaseFile);
-}
-function teamFileSlug(group) {
-  return String(group || "team").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/Ä‘/g, "d").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "team";
-}
-function defaultTeamCampaign(group) {
-  return {
-    group,
-    subject: `A fresh look for ${group} fans`,
-    plainText: `Weâ€™ve put together a fresh Viluxzone collection inspired by ${group} colours and matchday spirit.\n\nBrowse the collection here:\n{{collection_url}}\n\nThanks for being part of the Viluxzone community.\n\nBest regards,\nViluxzone Team.`,
-    htmlPreview: "",
-    collectionUrl: CLUB_COLLECTIONS[group] || "",
-    updatedAt: new Date().toISOString(),
-    isDefault: true,
-  };
-}
-function writeTeamFiles() {
-  if (cloud.current()) return;
-  const groups = new Map();
-  for (const recipient of database.recipients) {
-    const group = recipient.group || "ChÆ°a phÃ¢n loáº¡i";
-    if (!groups.has(group)) groups.set(group, []);
-    groups.get(group).push(recipient);
-  }
-  for (const [group, recipients] of groups) {
-    const slug = teamFileSlug(group);
-    fs.writeFileSync(path.join(teamFilesDirectory, `${slug}.json`), JSON.stringify({ group, updatedAt: new Date().toISOString(), recipients }, null, 2), "utf8");
-    const quote = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
-    const csv = ["Email,Name,Team", ...recipients.map((recipient) => [recipient.email, recipient.name, group].map(quote).join(","))].join("\r\n");
-    fs.writeFileSync(path.join(teamFilesDirectory, `${slug}.csv`), `\ufeff${csv}`, "utf8");
-    const contentPath = resolveTeamContentFile(group);
-    if (!fs.existsSync(contentPath)) fs.writeFileSync(contentPath, JSON.stringify(defaultTeamCampaign(group), null, 2), "utf8");
-  }
-}
-function resolveTeamContentFile(group) { return path.join(teamContentDirectory, `${teamFileSlug(group)}.json`); }
-function loadTeamContent(group) {
-  if (cloud.current()) return cloud.current().teamContent[teamFileSlug(group)] || null;
-  try { return JSON.parse(fs.readFileSync(resolveTeamContentFile(group), "utf8")); } catch { return null; }
-}
-function getPublicBaseUrl(request) {
-  const configured = cleanText(process.env.TRACKER_PUBLIC_URL).replace(/\/$/, "");
-  return configured || `${request.protocol}://${request.get("host")}`;
-}
-function addUtmParameters(rawUrl, campaign, recipient) {
-  try {
-    const url = new URL(rawUrl);
-    url.searchParams.set("utm_source", "email");
-    url.searchParams.set("utm_medium", "internal_nodemail");
-    url.searchParams.set("utm_campaign", campaign.utmCampaign);
-    url.searchParams.set("utm_content", recipient.token);
-    if (recipient.group) url.searchParams.set("utm_term", recipient.group);
-    return url.toString();
-  } catch { return rawUrl; }
-}
-function trackedUrl(rawUrl, campaign, recipient, baseUrl) { return `${baseUrl}/r/${encodeURIComponent(recipient.token)}?url=${encodeURIComponent(addUtmParameters(rawUrl, campaign, recipient))}`; }
-function replaceLinks(content, campaign, recipient, baseUrl) { return content.replace(/https?:\/\/[^\s<>\")]+/gi, (url) => trackedUrl(url, campaign, recipient, baseUrl)); }
-function personalize(content, recipient) { return content.replace(/{{\s*name\s*}}/gi, recipient.name || "there").replace(/{{\s*email\s*}}/gi, recipient.email).replace(/{{\s*group\s*}}/gi, recipient.group || ""); }
-function composeRecipientText(campaign, recipient) {
-  const withCollection = campaign.plainText.replace(/{{\s*collection_url\s*}}/gi, campaign.collectionUrl || "");
-  const body = personalize(withCollection, recipient);
-  const greeting = campaign.addGreeting && recipient.name ? `Dear ${recipient.name},\n\n` : "";
-  return replaceLinks(`${greeting}${body}`, campaign, recipient, campaign.trackerBaseUrl);
-}
-function safeDestination(value) { try { const url = new URL(value); return ["http:", "https:"].includes(url.protocol) ? url.toString() : null; } catch { return null; } }
-function getSmtpConfig(encrypted) { return smtpSettings.decrypt(encrypted || cloud.current()?.smtp) || smtpSettings.environment(); }
-function getTransporter(encrypted) {
-  const config = getSmtpConfig(encrypted);
-  const host = cleanText(config.host), user = cleanText(config.user), password = config.password;
-  if (!host || !user || !password) throw new Error("Thiáº¿u SMTP_HOST, SMTP_USER hoáº·c SMTP_PASS trong file .env.");
-  if (/your-domain|replace-with/i.test(`${user} ${password}`)) throw new Error("SMTP váº«n dÃ¹ng thÃ´ng tin máº«u. HÃ£y Ä‘iá»n biáº¿n mÃ´i trÆ°á»ng SMTP há»£p lá»‡.");
-  return nodemailer.createTransport({ host, port: config.port, secure: config.secure, requireTLS: !config.secure,
-    from: config.from || user, connectionTimeout: 15000, greetingTimeout: 15000, socketTimeout: 25000, auth: { user, pass: password } });
-}
-function recipientPayload() {
-  const groups = {};
-  database.recipients.forEach((recipient) => { groups[recipient.group || "ChÆ°a phÃ¢n loáº¡i"] = (groups[recipient.group || "ChÆ°a phÃ¢n loáº¡i"] || 0) + 1; });
-  return { recipients: database.recipients, groups };
-}
-function isRecentlySentSameContent(email, fingerprint) {
-  const cutoff = Date.now() - duplicateWindowMs;
-  return database.campaigns.some((campaign) => campaign.contentHash === fingerprint && campaign.recipients.some((recipient) => recipient.email === email && recipient.status === "sent" && Date.parse(recipient.sentAt) >= cutoff));
-}
-function campaignSummary(campaign) {
-  const events = database.events.filter((event) => event.campaignId === campaign.id);
-  const uniqueByEvent = (type) => new Set(events.filter((event) => event.type === type).map((event) => event.token)).size;
-  const count = (status) => campaign.recipients.filter((recipient) => recipient.status === status).length;
-  return {
-    id: campaign.id, subject: campaign.subject, createdAt: campaign.createdAt, status: campaign.status || "completed", nextSendAt: campaign.nextSendAt || null, completedAt: campaign.completedAt || null,
-    total: campaign.recipients.length, queued: count("queued"), sending: count("sending"), sent: count("sent"), failed: count("failed"), blocked: count("blocked"),
-    progressPercent: campaign.recipients.length ? Math.round((count("sent") + count("failed") + count("blocked")) * 100 / campaign.recipients.length) : 100,
-    currentEmail: campaign.recipients.find((recipient) => recipient.status === "sending")?.email || "",
-    lastSentEmail: campaign.recipients.filter((recipient) => recipient.status === "sent").sort((a, b) => Date.parse(b.sentAt || 0) - Date.parse(a.sentAt || 0))[0]?.email || "",
-    lastSentAt: campaign.recipients.filter((recipient) => recipient.status === "sent").sort((a, b) => Date.parse(b.sentAt || 0) - Date.parse(a.sentAt || 0))[0]?.sentAt || null,
-    clicked: uniqueByEvent("click"), addedToCart: uniqueByEvent("add_to_cart"), checkout: uniqueByEvent("begin_checkout"), purchased: uniqueByEvent("purchase"),
-  };
-}
-const eventLabel = (type) => ({ click: "ÄÃ£ báº¥m link", add_to_cart: "ÄÃ£ thÃªm giá»", begin_checkout: "ÄÃ£ checkout", purchase: "ÄÃ£ mua hÃ ng", view_link: "ÄÃ£ xem link" })[type] || type;
-
-let workerTimer = null;
-let workerBusy = false;
-function clearWorkerTimer() { if (workerTimer) clearTimeout(workerTimer); workerTimer = null; }
-function scheduleWorker(delayMs = 0) {
-  if (cloud.enabled) { cloud.schedule(delayMs); return; }
-  clearWorkerTimer();
-  workerTimer = setTimeout(() => { workerTimer = null; runQueue().catch((error) => console.error("Queue error:", error)); }, Math.max(delayMs, 0));
-}
-function finishCampaignIfDone(campaign) {
-  if (!campaign.recipients.some((recipient) => ["queued", "sending"].includes(recipient.status))) {
-    campaign.status = "completed";
-    campaign.completedAt = campaign.completedAt || new Date().toISOString();
-    campaign.nextSendAt = null;
-  }
-}
-async function runQueue() {
-  if (workerBusy) return;
-  const campaign = database.campaigns.find((item) => item.status === "running");
-  if (!campaign) return;
-  const recipient = campaign.recipients.find((item) => item.status === "queued");
-  if (!recipient) { finishCampaignIfDone(campaign); saveDatabase(); scheduleWorker(0); return; }
-  const waitUntil = Date.parse(campaign.nextSendAt || "");
-  if (Number.isFinite(waitUntil) && waitUntil > Date.now()) { scheduleWorker(waitUntil - Date.now()); return; }
-  workerBusy = true;
-  recipient.status = "sending";
-  saveDatabase();
-  try {
-    const transporter = getTransporter();
-    const trackerBaseUrl = campaign.trackerBaseUrl;
-    await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: recipient.email,
-      subject: personalize(campaign.subject, recipient),
-      text: composeRecipientText(campaign, recipient),
-    });
-    recipient.status = "sent";
-    recipient.sentAt = new Date().toISOString();
-    try {
-      const history = loadSentHistory(sentHistoryFile);
-      recordSent(history, { email: recipient.email, club: recipient.group, subject: personalize(campaign.subject, recipient), body: composeRecipientText(campaign, recipient), sentAt: recipient.sentAt, funnel: campaign.funnel || campaign.type || "" });
-      saveSentHistory(sentHistoryFile, history);
-    } catch (historyError) {
-      recipient.historyError = `Email Ä‘Ã£ gá»­i; ghi sent_history tháº¥t báº¡i: ${historyError.message}`;
-      console.error(recipient.historyError);
-    }
-  } catch (error) {
-    recipient.status = "failed";
-    recipient.error = error.message;
-  } finally {
-    workerBusy = false;
-  }
-  if (campaign.status === "running") {
-    finishCampaignIfDone(campaign);
-    if (campaign.status === "running") campaign.nextSendAt = new Date(Date.now() + randomDelay()).toISOString();
-  }
-  saveDatabase();
-  if (campaign.status === "running") scheduleWorker(Date.parse(campaign.nextSendAt) - Date.now());
-  else scheduleWorker(0);
-}
-
-function parseRecipientWorkbook(buffer, forcedGroup = "") {
-  let workbook;
-  try { workbook = XLSX.read(buffer, { type: "buffer", raw: false }); } catch { throw new Error("KhÃ´ng thá»ƒ Ä‘á»c file báº£ng tÃ­nh nÃ y."); }
-  const imported = [], invalidRows = [], existing = new Set(database.recipients.map((recipient) => recipient.email.toLowerCase()));
-  for (const sheetName of workbook.SheetNames) {
-    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: "", raw: false });
-    if (!rows.length) continue;
-    const headers = Object.keys(rows[0]);
-    const emailColumn = columnByPriority(headers, ["email", "mail", "emailaddress"]);
-    if (!emailColumn) continue;
-    const groupColumn = columnByPriority(headers, ["team", "group", "segment", "club", "doi", "nhom", "category"]);
-    const nameColumn = headers.find((header) => ["name", "fullname", "customername", "firstname", "customerfirst", "customerfirstname", "ten", "tenkhachhang"].includes(normalizedHeader(header)));
-    rows.forEach((row, index) => {
-      const email = cleanText(row[emailColumn]).toLowerCase();
-      if (!email) return;
-      if (!isEmail(email)) { invalidRows.push({ sheet: sheetName, row: index + 2 }); return; }
-      if (existing.has(email)) return;
-      existing.add(email);
-      imported.push({ id: newId("recipient"), email, name: nameColumn ? cleanText(row[nameColumn]) : "", group: forcedGroup || (groupColumn ? cleanText(row[groupColumn]) || "ChÆ°a phÃ¢n loáº¡i" : sheetName), sourceSheet: sheetName, createdAt: new Date().toISOString() });
-    });
-  }
-  if (!imported.length) throw new Error("KhÃ´ng tÃ¬m tháº¥y email má»›i. Cáº§n cá»™t Email, Team/Group hoáº·c Segment.");
-  database.recipients.push(...imported);
-  saveDatabase();
-  writeTeamFiles();
-  return { imported: imported.length, skippedInvalid: invalidRows.length, recipients: recipientPayload() };
-}
-
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: false }));
-app.use(express.static(path.join(__dirname, "public")));
-if (cloud.enabled) app.use(cloud.middleware);
-app.get("/api/health", async (request, response) => {
-  if (cloud.enabled && request.query.probe === "true") await cloud.probe();
-  const queueProbe = cloud.enabled && request.query.queue === "true" ? await cloud.queueProbe(request.query.wake === "true") : null;
-  if (request.query.smtp === "true") {
-    try { await getTransporter().verify(); }
-    catch (error) { return response.status(503).json({ ok: false, storage: "connected", smtp: "unavailable", code: error.code || "SMTP_ERROR" }); }
-  }
-  response.json({ ok: true, storage: cloud.enabled ? "private-blob" : "local", smtp: request.query.smtp === "true" ? "verified" : "not-tested", queueProbe });
-});
-app.get("/api/smtp-settings", (_request, response) => {
-  const config = getSmtpConfig();
-  response.set("Cache-Control", "no-store").json({ host: config.host, port: config.port, secure: config.secure,
-    user: /your-domain/.test(config.user) ? "" : config.user, from: /your-domain/.test(config.from) ? "" : config.from,
-    passwordSaved: smtpSettings.configured(config), editable: cloud.enabled });
-});
-app.put("/api/smtp-settings", (request, response) => {
-  if (!cloud.current()) return response.status(400).json({ error: "Báº£n local dÃ¹ng file .env." });
-  if (database.campaigns.some((campaign) => campaign.status === "running")) return response.status(409).json({ error: "Pause chiáº¿n dá»‹ch trÆ°á»›c khi Ä‘á»•i SMTP." });
-  const previous = getSmtpConfig();
-  const config = { host: cleanText(request.body.host), port: Number(request.body.port), secure: request.body.secure === true,
-    user: cleanText(request.body.user), password: String(request.body.password || "") || (previous.user === cleanText(request.body.user) ? previous.password : ""),
-    from: cleanText(request.body.from) || cleanText(request.body.user) };
-  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(config.host) || ![465, 587].includes(config.port) || !isEmail(config.user) || !smtpSettings.configured(config)
-      || config.password.length > 4096 || /[\r\n]/.test(config.from)) return response.status(400).json({ error: "Äiá»n host, cá»•ng 465/587, email vÃ  máº­t kháº©u SMTP há»£p lá»‡." });
-  cloud.current().smtp = smtpSettings.encrypt(config);
-  cloud.dirty();
-  response.json({ ok: true });
-});
-app.post("/api/smtp-verify", async (_request, response) => {
-  try { await getTransporter().verify(); response.json({ ok: true, message: "Káº¿t ná»‘i SMTP thÃ nh cÃ´ng. ChÆ°a gá»­i email." }); }
-  catch (error) { response.status(400).json({ error: `KhÃ´ng káº¿t ná»‘i Ä‘Æ°á»£c SMTP (${error.code || "CONFIG_ERROR"}). Kiá»ƒm tra host, email vÃ  máº­t kháº©u há»™p thÆ°.` }); }
-});
-app.get("/api/settings", (request, response) => response.json({
-  trackerBaseUrl: getPublicBaseUrl(request), trackerIsPublic: Boolean(process.env.TRACKER_PUBLIC_URL) && (!cloud.enabled || process.env.TRACKER_PUBLIC_ACCESS === "true"), googleMeasurementId: process.env.GA4_MEASUREMENT_ID || "G-029PNZ8EV2",
-  smtpConfigured: smtpSettings.configured(getSmtpConfig()), from: getSmtpConfig().from,
-  defaultRecipientFileConfigured: Boolean(defaultRecipientFile), defaultRecipientFileName: defaultRecipientFile ? path.basename(defaultRecipientFile) : "", delayMinMinutes: sendDelayMinMs / 60_000, delayMaxMinutes: sendDelayMaxMs / 60_000,
-}));
-app.post("/api/recipients/import", upload.single("file"), (request, response) => {
-  if (!request.file) return response.status(400).json({ error: "Chá»n file danh sÃ¡ch email trÆ°á»›c khi nháº­p." });
-  try { response.json(parseRecipientWorkbook(request.file.buffer, cleanText(request.query.group))); } catch (error) { response.status(400).json({ error: error.message }); }
-});
-app.post("/api/recipients/import-source", (_request, response) => {
-  if (!defaultRecipientFile) return response.status(400).json({ error: "ChÆ°a cáº¥u hÃ¬nh DEFAULT_RECIPIENTS_FILE trong file .env." });
-  try { response.json(parseRecipientWorkbook(fs.readFileSync(defaultRecipientFile))); } catch (error) { response.status(400).json({ error: `KhÃ´ng thá»ƒ nháº­p file nguá»“n: ${error.message}` }); }
-});
-app.get("/api/recipients", (_request, response) => response.json(recipientPayload()));
-app.delete("/api/recipients", (_request, response) => { database.recipients = []; saveDatabase(); writeTeamFiles(); response.status(204).end(); });
-app.get("/api/club-collections", (_request, response) => response.json(CLUB_COLLECTIONS));
-app.get("/api/teams", (_request, response) => {
-  const groups = recipientPayload().groups;
-  const history = loadSentHistory(sentHistoryFile);
-  response.json(Object.entries(groups).sort((a, b) => a[0].localeCompare(b[0], "vi")).map(([group, count]) => ({ group, count, collectionUrl: CLUB_COLLECTIONS[group] || "", contentSaved: Boolean(loadTeamContent(group)), historyCount: Object.values(history).filter((entry) => entry?.club === group).length, fileName: `${teamFileSlug(group)}.csv` })));
-});
-app.get("/api/team-content", (request, response) => {
-  const group = cleanText(request.query.group);
-  if (!group || group.length > 100) return response.status(400).json({ error: "Chá»n má»™t Ä‘á»™i há»£p lá»‡." });
-  response.json(loadTeamContent(group) || { group, subject: "", plainText: "", htmlPreview: "", collectionUrl: CLUB_COLLECTIONS[group] || "" });
-});
-app.put("/api/team-content", (request, response) => {
-  const group = cleanText(request.body.group);
-  if (!group || group.length > 100) return response.status(400).json({ error: "Chá»n má»™t Ä‘á»™i há»£p lá»‡." });
-  const rawCollectionUrl = cleanText(request.body.collectionUrl), collectionUrl = rawCollectionUrl ? safeDestination(rawCollectionUrl) : "";
-  if (rawCollectionUrl && !collectionUrl) return response.status(400).json({ error: "Collection URL cáº§n lÃ  liÃªn káº¿t http/https há»£p lá»‡." });
-  const content = {
-    group,
-    subject: cleanSubject(request.body.subject).slice(0, 200),
-    plainText: String(request.body.plainText ?? "").slice(0, 100_000),
-    htmlPreview: String(request.body.htmlPreview ?? "").slice(0, 100_000),
-    collectionUrl,
-    updatedAt: new Date().toISOString(),
-  };
-  if (cloud.current()) { cloud.current().teamContent[teamFileSlug(group)] = content; cloud.dirty(); }
-  else fs.writeFileSync(resolveTeamContentFile(group), JSON.stringify(content, null, 2), "utf8");
-  response.json({ ok: true, group: content.group, updatedAt: content.updatedAt });
-});
-app.get("/api/teams/export", (request, response) => {
-  const group = cleanText(request.query.group);
-  if (!group) return response.status(400).send("Chá»n Ä‘á»™i cáº§n xuáº¥t.");
-  const rows = database.recipients.filter((recipient) => recipient.group === group);
-  if (!rows.length) return response.status(404).send("Äá»™i nÃ y chÆ°a cÃ³ email.");
-  const quote = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
-  const csv = ["Email,Name,Team", ...rows.map((recipient) => [recipient.email, recipient.name, recipient.group].map(quote).join(","))].join("\r\n");
-  response.setHeader("Content-Type", "text/csv; charset=utf-8");
-  response.setHeader("Content-Disposition", `attachment; filename="${teamFileSlug(group)}.csv"`);
-  response.send(`\ufeff${csv}`);
-});
-
-function campaignRequestedRecipients(body, persistManual = false) {
-  const selectedGroups = Array.isArray(body.groups) ? body.groups.map(cleanText).filter(Boolean) : [];
-  if (selectedGroups.length > 1) throw new Error("Gá»­i tá»«ng Ä‘á»™i má»™t Ä‘á»ƒ dÃ¹ng Ä‘Ãºng ná»™i dung riÃªng cá»§a tá»«ng Ä‘á»™i.");
-  let requested = database.recipients.filter((recipient) => selectedGroups.includes(recipient.group));
-  const rawManual = String(body.manualEmails ?? "").split(/[\r\n,;\t ]+/).map((email) => email.trim().toLowerCase()).filter(Boolean);
-  const invalidManual = rawManual.filter((email) => !isEmail(email));
-  if (invalidManual.length) throw new Error(`CÃ³ ${invalidManual.length} Ä‘á»‹a chá»‰ email nháº­p tay khÃ´ng há»£p lá»‡.`);
-  const uniqueManual = [...new Set(rawManual)];
-  for (const email of uniqueManual) {
-    const existsInRequested = requested.some((recipient) => recipient.email.toLowerCase() === email);
-    if (existsInRequested) continue;
-    let existing = database.recipients.find((recipient) => recipient.email.toLowerCase() === email);
-    if (!existing) {
-      existing = { id: newId("recipient"), email, name: "", group: selectedGroups[0] || "Danh sÃ¡ch nháº­p tay", sourceSheet: "manual", createdAt: new Date().toISOString() };
-      if (persistManual) database.recipients.push(existing);
-    }
-    requested.push(existing);
-  }
-  const deduped = [...new Map(requested.map((recipient) => [recipient.email.toLowerCase(), recipient])).values()];
-  return { requested: deduped, selectedGroups, manualCount: uniqueManual.length };
-}
-function inspectCampaignDuplicates(body, recipients) {
-  const history = createHistoryIndex(loadSentHistory(sentHistoryFile));
-  const collectionUrl = safeDestination(cleanText(body.collectionUrl)) || "";
-  return recipients.map((recipient) => {
-    const campaign = { plainText: String(body.plainText ?? "").replace(/{{\s*collection_url\s*}}/gi, collectionUrl), addGreeting: body.addGreeting !== false, trackerBaseUrl: "", utmCampaign: "" };
-    const finalBody = personalize(campaign.plainText, recipient);
-    const greeting = campaign.addGreeting && recipient.name ? `Dear ${recipient.name},\n\n` : "";
-    const result = inspectDuplicate(history, recipient.email, personalize(cleanSubject(body.subject), recipient), `${greeting}${finalBody}`);
-    result.recentCampaign = isRecentlySentSameContent(recipient.email, contentFingerprint(cleanSubject(body.subject), String(body.plainText ?? "").replace(/{{\s*collection_url\s*}}/gi, collectionUrl)));
-    result.isDuplicate = result.isDuplicate || result.recentCampaign;
-    return { email: recipient.email, group: recipient.group, ...result };
-  });
-}
-app.post("/api/campaigns/preview", (request, response) => {
-  const subject = cleanSubject(request.body.subject), plainText = cleanText(request.body.plainText);
-  if (!subject || !plainText) return response.status(400).json({ error: "Cáº§n cÃ³ tiÃªu Ä‘á» vÃ  ná»™i dung Text." });
-  const rawCollectionUrl = cleanText(request.body.collectionUrl), collectionUrl = rawCollectionUrl ? safeDestination(rawCollectionUrl) : "";
-  if (rawCollectionUrl && !collectionUrl) return response.status(400).json({ error: "Collection URL cáº§n lÃ  liÃªn káº¿t http/https há»£p lá»‡." });
-  if (/{{\s*collection_url\s*}}/i.test(plainText) && !collectionUrl) return response.status(400).json({ error: "Ná»™i dung Ä‘ang cÃ³ {{collection_url}} nhÆ°ng chÆ°a chá»n/dÃ¡n Collection URL." });
-  let audience;
-  try { audience = campaignRequestedRecipients(request.body, false); } catch (error) { return response.status(400).json({ error: error.message }); }
-  const duplicates = inspectCampaignDuplicates(request.body, audience.requested).filter((item) => item.isDuplicate);
-  response.json({ total: audience.requested.length, manualCount: audience.manualCount, duplicateCount: duplicates.length, duplicates: duplicates.slice(0, 100), duplicateHistory: "Lá»‹ch sá»­ cÅ© Ä‘Æ°á»£c so email + tiÃªu Ä‘á»; cÃ¡c lÆ°á»£t gá»­i má»›i Ä‘Æ°á»£c so cáº£ ná»™i dung chuáº©n hÃ³a." });
-});
-
-app.post("/api/campaigns/send", async (request, response) => {
-  const subject = cleanSubject(request.body.subject), plainText = cleanText(request.body.plainText);
-  if (!subject || !plainText) return response.status(400).json({ error: "Cáº§n cÃ³ tiÃªu Ä‘á» vÃ  ná»™i dung Text." });
-  if (database.campaigns.some((campaign) => ["running", "paused"].includes(campaign.status))) return response.status(409).json({ error: "Äang cÃ³ má»™t chiáº¿n dá»‹ch chÆ°a hoÃ n táº¥t. HÃ£y Pause/Resume hoáº·c chá» chiáº¿n dá»‹ch Ä‘Ã³ gá»­i xong." });
-  let audience;
-  try { audience = campaignRequestedRecipients(request.body, true); } catch (error) { return response.status(400).json({ error: error.message }); }
-  const { requested, selectedGroups } = audience;
-  if (!requested.length) return response.status(400).json({ error: "ChÆ°a chá»n Ä‘á»™i hoáº·c nhÃ³m email." });
-  const collectionUrl = safeDestination(cleanText(request.body.collectionUrl)) || "";
-  if (cleanText(request.body.collectionUrl) && !collectionUrl) return response.status(400).json({ error: "Collection URL cáº§n lÃ  liÃªn káº¿t http/https há»£p lá»‡." });
-  if (/{{\s*collection_url\s*}}/i.test(plainText) && !collectionUrl) return response.status(400).json({ error: "Ná»™i dung Ä‘ang cÃ³ {{collection_url}} nhÆ°ng chÆ°a chá»n/dÃ¡n Collection URL." });
-  const duplicateChecks = inspectCampaignDuplicates(request.body, requested);
-  const duplicatesByEmail = new Map(duplicateChecks.filter((item) => item.isDuplicate).map((item) => [item.email.toLowerCase(), item]));
-  saveDatabase();
-  writeTeamFiles();
-  try { const transporter = getTransporter(); await transporter.verify(); } catch (error) { return response.status(400).json({ error: `SMTP chÆ°a sáºµn sÃ ng: ${error.message}` }); }
-  const fingerprint = contentFingerprint(subject, plainText);
-  const seenInCycle = new Set();
-  const recipients = requested.map((recipient) => {
-    const base = { recipientId: recipient.id, email: recipient.email, name: recipient.name, group: recipient.group, token: newId("mail"), status: "queued", sentAt: null, error: null };
-    if (seenInCycle.has(recipient.email)) return { ...base, status: "blocked", blockedReason: "TrÃ¹ng email trong vÃ²ng gá»­i hiá»‡n táº¡i" };
-    seenInCycle.add(recipient.email);
-    const historyDuplicate = duplicatesByEmail.get(recipient.email.toLowerCase());
-    if (historyDuplicate && request.body.allowDuplicates !== true) {
-      const reasons = [historyDuplicate.sameSubject && "Ä‘Ã£ nháº­n cÃ¹ng tiÃªu Ä‘á»", historyDuplicate.sameContent && "Ä‘Ã£ nháº­n cÃ¹ng ná»™i dung"].filter(Boolean).join(" vÃ  ");
-      return { ...base, status: "blocked", blockedReason: `sent_history.json: ${reasons || "trÃ¹ng lá»‹ch sá»­"}` };
-    }
-    if (isRecentlySentSameContent(recipient.email, fingerprint) && request.body.allowDuplicates !== true) return { ...base, status: "blocked", blockedReason: "ÄÃ£ nháº­n cÃ¹ng ná»™i dung trong 3 ngÃ y gáº§n nháº¥t" };
-    return base;
-  });
-  const campaign = {
-    id: newId("campaign"), createdAt: new Date().toISOString(), subject, plainText, htmlPreview: cleanText(request.body.htmlPreview), contentHash: fingerprint,
-    group: selectedGroups[0] || "Danh sÃ¡ch nháº­p tay", collectionUrl, funnel: cleanText(request.body.funnel), type: cleanText(request.body.type),
-    utmCampaign: cleanText(request.body.utmCampaign) || `email_${Date.now()}`, trackerBaseUrl: getPublicBaseUrl(request), addGreeting: request.body.addGreeting !== false, recipients, status: "running", nextSendAt: null, completedAt: null,
-  };
-  finishCampaignIfDone(campaign);
-  database.campaigns.unshift(campaign); saveDatabase();
-  if (campaign.status === "running") scheduleWorker(0);
-  const summary = campaignSummary(campaign);
-  response.status(202).json({ campaign: summary, duplicateBlocked: summary.blocked, message: summary.blocked ? `${summary.blocked} email Ä‘Ã£ bá»‹ cháº·n vÃ¬ trÃ¹ng ná»™i dung trong 3 ngÃ y hoáº·c trÃ¹ng vÃ²ng gá»­i.` : "Chiáº¿n dá»‹ch Ä‘Ã£ vÃ o hÃ ng Ä‘á»£i gá»­i." });
-});
-app.post("/api/campaigns/:id/pause", (request, response) => {
-  const campaign = database.campaigns.find((item) => item.id === request.params.id);
-  if (!campaign || campaign.status !== "running") return response.status(400).json({ error: "Chá»‰ cÃ³ thá»ƒ pause chiáº¿n dá»‹ch Ä‘ang gá»­i." });
-  campaign.status = "paused"; campaign.nextSendAt = null; saveDatabase(); clearWorkerTimer();
-  response.json({ campaign: campaignSummary(campaign) });
-});
-app.post("/api/campaigns/:id/resume", (request, response) => {
-  const campaign = database.campaigns.find((item) => item.id === request.params.id);
-  if (!campaign || campaign.status !== "paused") return response.status(400).json({ error: "Chá»‰ cÃ³ thá»ƒ tiáº¿p tá»¥c chiáº¿n dá»‹ch Ä‘ang pause." });
-  if (!campaign.recipients.some((recipient) => recipient.status === "queued")) { finishCampaignIfDone(campaign); saveDatabase(); return response.json({ campaign: campaignSummary(campaign) }); }
-  campaign.status = "running"; campaign.nextSendAt = null; saveDatabase(); scheduleWorker(0);
-  response.json({ campaign: campaignSummary(campaign) });
-});
-
-app.get("/api/dashboard", (_request, response) => {
-  const campaigns = database.campaigns.map(campaignSummary);
-  const rows = database.campaigns.flatMap((campaign) => campaign.recipients.map((recipient) => {
-    const events = database.events.filter((event) => event.token === recipient.token), has = (type) => events.some((event) => event.type === type);
-    const status = recipient.status === "blocked" ? "ÄÃ£ cháº·n trÃ¹ng" : recipient.status === "queued" ? "Äang chá» gá»­i" : recipient.status === "sending" ? "Äang gá»­i" : recipient.status === "failed" ? "Gá»­i lá»—i" : has("purchase") ? "ÄÃ£ mua hÃ ng" : has("begin_checkout") ? "ÄÃ£ checkout" : has("add_to_cart") ? "ÄÃ£ thÃªm giá»" : has("view_link") ? "ÄÃ£ xem link" : has("click") ? "ÄÃ£ báº¥m link" : recipient.status === "sent" ? "ÄÃ£ gá»­i" : "ChÆ°a cÃ³ tÆ°Æ¡ng tÃ¡c";
-    return { campaignId: campaign.id, campaignSubject: campaign.subject, email: recipient.email, name: recipient.name, group: recipient.group, sentAt: recipient.sentAt, status, blockedReason: recipient.blockedReason || "", events: events.map((event) => ({ ...event, label: eventLabel(event.type) })) };
-  }));
-  response.json({ campaigns, rows });
-});
-app.get("/r/:token", (request, response) => {
-  const campaign = database.campaigns.find((item) => item.recipients.some((recipient) => recipient.token === request.params.token));
-  const recipient = campaign?.recipients.find((item) => item.token === request.params.token), destination = safeDestination(cleanText(request.query.url));
-  if (!campaign || !recipient || !destination) return response.status(400).send("LiÃªn káº¿t khÃ´ng há»£p lá»‡.");
-  database.events.push({ id: newId("event"), campaignId: campaign.id, token: recipient.token, type: "click", createdAt: new Date().toISOString(), url: destination }); saveDatabase(); response.redirect(destination);
-});
-app.options("/event/:token", (_request, response) => response.set("Access-Control-Allow-Origin", "*").set("Access-Control-Allow-Headers", "Content-Type").sendStatus(204));
-app.post("/event/:token", (request, response) => {
-  response.set("Access-Control-Allow-Origin", "*");
-  const allowedTypes = new Set(["add_to_cart", "begin_checkout", "purchase", "view_link"]), type = cleanText(request.body.event || request.query.event);
-  const campaign = database.campaigns.find((item) => item.recipients.some((recipient) => recipient.token === request.params.token));
-  if (!campaign || !allowedTypes.has(type)) return response.status(400).json({ error: "Token hoáº·c loáº¡i sá»± kiá»‡n khÃ´ng há»£p lá»‡." });
-  database.events.push({ id: newId("event"), campaignId: campaign.id, token: request.params.token, type, createdAt: new Date().toISOString(), value: Number(request.body.value || 0) || undefined }); saveDatabase(); response.status(201).json({ ok: true });
-});
-app.use((error, _request, response, _next) => { console.error(error); response.status(400).json({ error: error.message || "YÃªu cáº§u khÃ´ng há»£p lá»‡." }); });
-if (!cloud.enabled) {
-  writeTeamFiles();
-  app.listen(port, host, () => { console.log(`Nodemail Ä‘ang cháº¡y táº¡i http://127.0.0.1:${port}`); if (database.campaigns.some((campaign) => campaign.status === "running")) scheduleWorker(0); });
-}
-module.exports = app;
-module.exports.queueHelpers = { getTransporter, personalize, composeRecipientText, recordSent, finishCampaignIfDone, randomDelay };
-
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×o6Õ:-jZ.¶›­–)Ş³W&WV—&R‚&F÷FVçb"’æ6öæf–r‚“°Ğ Ğ¦6öç7B7'—FòÒ&WV—&R‚&7'—Fò"“°Ğ¦6öç7Bg2Ò&WV—&R‚&g2"“°Ğ¦6öç7BF‚Ò&WV—&R‚'F‚"“°Ğ¦6öç7BW‡&W72Ò&WV—&R‚&W‡&W72"“°Ğ¦6öç7B×VÇFW"Ò&WV—&R‚&×VÇFW""“°Ğ¦6öç7BæöFVÖ–ÆW"Ò&WV—&R‚&æöFVÖ–ÆW""“°Ğ¦6öç7B„Å5‚Ò&WV—&R‚'†Ç7‚"“°Ğ¦6öç7B²4ÅT%ô4ôÄÄT5D”ôå2ÒÒ&WV—&R‚"âö6ÇV"ÖFF"“°Ğ¦6öç7B†—7F÷'”f–ÆW2Ò&WV—&R‚"â÷6VçBÖ†—7F÷'’"“°Ğ¦6öç7B²7&VFT†—7F÷'”–æFW‚Â–ç7V7DGWÆ–6FRÂ&V6÷&E6VçBÒÒ†—7F÷'”f–ÆW3°Ğ¦6öç7B6Æ÷VBÒ&WV—&R‚"âö6Æ÷VB×7F÷&R"“°Ğ¦6öç7B6×G6WGF–æw2Ò&WV—&R‚"â÷6×G×6WGF–æw2"“°Ğ¦gVæ7F–öâÆöE6VçD†—7F÷'’†f–ÆR’²&WGW&â6Æ÷VBæ7W'&VçB‚“òæ†—7F÷'’ÇÂ†—7F÷'”f–ÆW2æÆöE6VçD†—7F÷'’†f–ÆR“²ĞĞ¦gVæ7F–öâ6fU6VçD†—7F÷'’†f–ÆRÂ†—7F÷'’’²–b†6Æ÷VBæ7W'&VçB‚’’²6Æ÷VBæ7W'&VçB‚’æ†—7F÷'’Ò†—7F÷'“²6Æ÷VBæF—'G’‚“²ÒVÇ6R†—7F÷'”f–ÆW2ç6fU6VçD†—7F÷'’†f–ÆRÂ†—7F÷'’“²ĞĞ Ğ¦6öç7BÒW‡&W72‚“°Ğ¦6öç7B÷'BÒçVÖ&W"‡&ö6W72æVçbåõ%BÇÂ33“°Ğ¦6öç7B†÷7BÒ&ö6W72æVçbä„õ5BÇÂ##rããã#°Ğ¦6öç7BFFF—&V7F÷'’Ò&ö6W72æVçbådU$4TÂò"÷F×öæöFVÖ–Â"¢F‚æ¦ö–â…õöF—&æÖRÂ&FF"“°Ğ¦6öç7BFF&6Tf–ÆRÒF‚æ¦ö–â†FFF—&V7F÷'’Â&Ö–ÂÖFFæ§6öâ"“°Ğ¦6öç7BFVÔf–ÆW4F—&V7F÷'’ÒF‚æ¦ö–â†FFF—&V7F÷'’Â'FVÒÖf–ÆW2"“°Ğ¦6öç7BFVÔ6öçFVçDF—&V7F÷'’ÒF‚æ¦ö–â†FFF—&V7F÷'’Â'FVÒÖ6öçFVçB"“°Ğ¦6öç7B6VçD†—7F÷'”f–ÆRÒF‚æ¦ö–â…õöF—&æÖRÂ'6VçEö†—7F÷'’æ§6öâ"“°Ğ¦6öç7BFVfVÇE&V6—–VçE6WGF–ærÒ6ÆVåFW‡B‡&ö6W72æVçbäDTdTÅEõ$T4•”TåE5ôd”ÄR“°Ğ¦6öç7BFVfVÇE&V6—–VçDf–ÆRÒFVfVÇE&V6—–VçE6WGF–æròF‚ç&W6öÇfR…õöF—&æÖRÂFVfVÇE&V6—–VçE6WGF–ær’¢"#°Ğ¦6öç7B6VæDFVÆ”Ö–ä×2ÒÖF‚æÖ‚„çVÖ&W"‡&ö6W72æVçbå4TäEôDTÄ•ôÔ”åôÕ2ÇÂcó’Âcó“°Ğ¦6öç7B6VæDFVÆ”Ö„×2ÒÖF‚æÖ‚„çVÖ&W"‡&ö6W72æVçbå4TäEôDTÄ•ôÔ…ôÕ2ÇÂ#ó’Â6VæDFVÆ”Ö–ä×2“°Ğ¦6öç7BGWÆ–6FUv–æF÷t×2Ò2¢#B¢c¢c¢°Ğ¦6öç7BWÆöBÒ×VÇFW"‡°Ğ¢7F÷&vS¢×VÇFW"æÖVÖ÷'•7F÷&vR‚’ÀĞ¢Æ–Ö—G3¢²f–ÆU6—¦S¢"¢#B¢#BÒÀĞ¢f–ÆTf–ÇFW#¢…÷&WVW7BÂf–ÆRÂFöæR’Óâ°Ğ¢6öç7BÆÆ÷vVBÒõÂâ‡†Ç7‡Æ77b’Bö’çFW7B†f–ÆRæ÷&–v–æÆæÖR“°Ğ¢FöæR†ÆÆ÷vVBòçVÆÂ¢æWrW'&÷"‚$6¸’¹rG.º2f–ÆRç†Ç7‚†ş«v2æ77bâ"’ÂÆÆ÷vVB“°Ğ¢ÒÀĞ§Ò“°Ğ Ğ¦g2æÖ¶F—%7–æ2†FFF—&V7F÷'’Â²&V7W'6—fS¢G'VRÒ“°Ğ¦g2æÖ¶F—%7–æ2‡FVÔf–ÆW4F—&V7F÷'’Â²&V7W'6—fS¢G'VRÒ“°Ğ¦g2æÖ¶F—%7–æ2‡FVÔ6öçFVçDF—&V7F÷'’Â²&V7W'6—fS¢G'VRÒ“°Ğ¦6öç7BæWt–BÒ‡&Vf—‚’ÓâG·&Vf—‡ÕòG¶7'—Fòç&æFöÔ'—FW2ƒ’çFõ7G&–ær‚&†W‚"—Ö°Ğ¦gVæ7F–öâ6ÆVåFW‡B‡fÇVR’²&WGW&â7G&–ær‡fÇVRóò""’çG&–Ò‚“²ĞĞ¦gVæ7F–öâÆöö·4Æ–¶TFFTæÖR‡fÇVR’²6öç7BFW‡BÒ6ÆVåFW‡B‡fÇVR“²&WGW&âõâƒó¥ÆG³GÕ²ÒòåÕÆG³Ã'Õ²ÒòåÕÆG³Ã'×ÅÆG³Ã'Õ²ÒòåÕÆG³Ã'Õ²ÒòåÕÆG³"ÃGÒ•Æ"òçFW7B‡FW‡B“²ĞĞ¦gVæ7F–öâ6ÆVå7V&¦V7B‡fÇVR’²&WGW&â6ÆVåFW‡B‡fÇVR’ç&WÆ6R‚õµÇ%ÆåÒ²örÂ""“²ĞĞ¦gVæ7F–öâ—4VÖ–Â‡fÇVR’²&WGW&âõåµåÇ4Ò´µåÇ4ÒµÂåµåÇ4Ò²BòçFW7B†6ÆVåFW‡B‡fÇVR’“²ĞĞ¦gVæ7F–öâæ÷&ÖÆ—¦VD†VFW"‡fÇVR’²&WGW&â6ÆVåFW‡B‡fÇVR’çFôÆ÷vW$66R‚’ææ÷&ÖÆ—¦R‚$ädB"’ç&WÆ6R‚õµÇS3ÕÇS3feÒörÂ""’ç&WÆ6R‚üIörÂ&B"’ç&WÆ6R‚õµæ×£Ó•ÒörÂ""“²ĞĞ¦gVæ7F–öâ6öÇVÖä'•&–÷&—G’††VFW'2ÂFW&×2’²&WGW&â†VFW'2æf–æB‚††VFW"’ÓâFW&×2ç6öÖR‚‡FW&Ò’Óâæ÷&ÖÆ—¦VD†VFW"††VFW"’æ–æ6ÇVFW2‡FW&Ò’’“²ĞĞ¦gVæ7F–öâ&æFöÔFVÆ’‚’²&WGW&â6VæDFVÆ”Ö–ä×2²ÖF‚æfÆö÷"„ÖF‚ç&æFöÒ‚’¢‡6VæDFVÆ”Ö„×2Ò6VæDFVÆ”Ö–ä×2²’“²ĞĞ¦gVæ7F–öâ6öçFVçDf–ævW'&–çB‡7V&¦V7BÂÆ–åFW‡B’²&WGW&â7'—Fòæ7&VFT†6‚‚'6†#Sb"’çWFFR†G¶6ÆVå7V&¦V7B‡7V&¦V7B—ÕÆâG¶6ÆVåFW‡B‡Æ–åFW‡B—ÖÂ'WFc‚"’æF–vW7B‚&†W‚"“²ĞĞ Ğ¦gVæ7F–öâÆöDFF&6R‚’°Ğ¢–b‚g2æW†—7G57–æ2†FF&6Tf–ÆR’’&WGW&â²&V6—–VçG3¢µÒÂ6×–vç3¢µÒÂWfVçG3¢µÒÓ°Ğ¢G'’°Ğ¢6öç7B7F÷&VBÒ¥4ôâç'6R†g2ç&VDf–ÆU7–æ2†FF&6Tf–ÆRÂ'WFc‚"’“°Ğ¢&WGW&â°Ğ¢&V6—–VçG3¢'&’æ—4'&’‡7F÷&VBç&V6—–VçG2’ò7F÷&VBç&V6—–VçG2æÖ‚‡&V6—–VçB’ÓâÆöö·4Æ–¶TFFTæÖR‡&V6—–VçBææÖR’ò²ââç&V6—–VçBÂæÖS¢""Ò¢&V6—–VçB’¢µÒÀĞ¢6×–vç3¢'&’æ—4'&’‡7F÷&VBæ6×–vç2’ò7F÷&VBæ6×–vç2¢µÒÀĞ¢WfVçG3¢'&’æ—4'&’‡7F÷&VBæWfVçG2’ò7F÷&VBæWfVçG2¢µÒÀĞ¢Ó°Ğ¢Ò6F6‚†W'&÷"’°Ğ¢6öç6öÆRæW'&÷"‚$¶Œ;FærI¸Ö2Ikº62NºòÆ¸wR<Z“¢"ÂW'&÷"æÖW76vR“°Ğ¢&WGW&â²&V6—–VçG3¢µÒÂ6×–vç3¢µÒÂWfVçG3¢µÒÓ°Ğ¢ĞĞ§ĞĞ¦6öç7BÆö6ÄFF&6RÒÆöDFF&6R‚“°Ğ¦6öç7BFF&6RÒæWr&÷‡’†Æö6ÄFF&6RÂ°Ğ¢vWB‡F&vWBÂ¶W’’²&WGW&â†6Æ÷VBæ7W'&VçB‚“òæFFÇÂF&vWB•¶¶W•Ó²ÒÀĞ¢6WB‡F&vWBÂ¶W’ÂfÇVR’²†6Æ÷VBæ7W'&VçB‚“òæFFÇÂF&vWB•¶¶W•ÒÒfÇVS²&WGW&âG'VS²ÒÀĞ§Ò“°Ğ¦gVæ7F–öâ6fTFF&6R‚’°Ğ¢–b†6Æ÷VBæ7W'&VçB‚’’²6Æ÷VBæF—'G’‚“²&WGW&ã²ĞĞ¢6öç7BFV×÷&'”f–ÆRÒG¶FF&6Tf–ÆWÒçF×°Ğ¢g2çw&—FTf–ÆU7–æ2‡FV×÷&'”f–ÆRÂ¥4ôâç7G&–æv–g’†FF&6RÂçVÆÂÂ"’Â'WFc‚"“°Ğ¢g2ç&VæÖU7–æ2‡FV×÷&'”f–ÆRÂFF&6Tf–ÆR“°Ğ§ĞĞ¦gVæ7F–öâFVÔf–ÆU6ÇVr†w&÷W’°Ğ¢&WGW&â7G&–ær†w&÷WÇÂ'FVÒ"’ææ÷&ÖÆ—¦R‚$ädB"’ç&WÆ6R‚õµÇS3ÕÇS3feÒörÂ""’ç&WÆ6R‚üIörÂ&B"’çFôÆ÷vW$66R‚’ç&WÆ6R‚õµæ×£Ó•Ò²örÂ"Ò"’ç&WÆ6R‚õâ×ÂÒBörÂ""’ÇÂ'FVÒ#°Ğ§ĞĞ¦gVæ7F–öâFVfVÇEFVÔ6×–vâ†w&÷W’°Ğ¢&WGW&â°Ğ¢w&÷WÀĞ¢7V&¦V7C¢g&W6‚Æöö²f÷"G¶w&÷WÒfç6ÀĞ¢Æ–åFW‡C¢""ÀĞ¢‡FÖÄ&öG“¢""ÀĞ¢6öÆÆV7F–öåW&Ã¢4ÅT%ô4ôÄÄT5D”ôå5¶w&÷WÒÇÂ""ÀĞ¢WFFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’ÀĞ¢—4FVfVÇC¢G'VRÀĞ¢Ó°Ğ§ĞĞ¦gVæ7F–öâw&—FUFVÔf–ÆW2‚’°Ğ¢–b†6Æ÷VBæ7W'&VçB‚’’&WGW&ã°Ğ¢6öç7Bw&÷W2ÒæWrÖ‚“°Ğ¢f÷"†6öç7B&V6—–VçBöbFF&6Rç&V6—–VçG2’°Ğ¢6öç7Bw&÷WÒ&V6—–VçBæw&÷WÇÂ$6ŒkŒ:&âÆşª’#°Ğ¢–b‚w&÷W2æ†2†w&÷W’’w&÷W2ç6WB†w&÷WÂµÒ“°Ğ¢w&÷W2ævWB†w&÷W’çW6‚‡&V6—–VçB“°Ğ¢ĞĞ¢f÷"†6öç7B¶w&÷WÂ&V6—–VçG5Òöbw&÷W2’°Ğ¢6öç7B6ÇVrÒFVÔf–ÆU6ÇVr†w&÷W“°Ğ¢g2çw&—FTf–ÆU7–æ2‡F‚æ¦ö–â‡FVÔf–ÆW4F—&V7F÷'’ÂG·6ÇVwÒæ§6öæ’Â¥4ôâç7G&–æv–g’‡²w&÷WÂWFFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’Â&V6—–VçG2ÒÂçVÆÂÂ"’Â'WFc‚"“°Ğ¢6öç7BV÷FRÒ‡fÇVR’Óâ"Gµ7G&–ær‡fÇVRóò""’ç&WÆ6R‚ò"örÂr""r—Ò&°Ğ¢6öç7B77bÒ²$VÖ–ÂÄæÖRÅFVÒ"Âââç&V6—–VçG2æÖ‚‡&V6—–VçB’Óâ·&V6—–VçBæVÖ–ÂÂ&V6—–VçBææÖRÂw&÷WÒæÖ‡V÷FR’æ¦ö–â‚"Â"’•Òæ¦ö–â‚%Ç%Æâ"“°Ğ¢g2çw&—FTf–ÆU7–æ2‡F‚æ¦ö–â‡FVÔf–ÆW4F—&V7F÷'’ÂG·6ÇVwÒæ77f’ÂÇVfVfbG¶77gÖÂ'WFc‚"“°Ğ¢6öç7B6öçFVçEF‚Ò&W6öÇfUFVÔ6öçFVçDf–ÆR†w&÷W“°Ğ¢–b‚g2æW†—7G57–æ2†6öçFVçEF‚’’g2çw&—FTf–ÆU7–æ2†6öçFVçEF‚Â¥4ôâç7G&–æv–g’†FVfVÇEFVÔ6×–vâ†w&÷W’ÂçVÆÂÂ"’Â'WFc‚"“°Ğ¢ĞĞ§ĞĞ¦gVæ7F–öâ&W6öÇfUFVÔ6öçFVçDf–ÆR†w&÷W’²&WGW&âF‚æ¦ö–â‡FVÔ6öçFVçDF—&V7F÷'’ÂG·FVÔf–ÆU6ÇVr†w&÷W—Òæ§6öæ“²ĞĞ¦gVæ7F–öâÆöEFVÔ6öçFVçB†w&÷W’°Ğ¢–b†6Æ÷VBæ7W'&VçB‚’’&WGW&â6Æ÷VBæ7W'&VçB‚’çFVÔ6öçFVçE·FVÔf–ÆU6ÇVr†w&÷W•ÒÇÂçVÆÃ°Ğ¢G'’²&WGW&â¥4ôâç'6R†g2ç&VDf–ÆU7–æ2‡&W6öÇfUFVÔ6öçFVçDf–ÆR†w&÷W’Â'WFc‚"’“²Ò6F6‚²&WGW&âçVÆÃ²ĞĞ§ĞĞ¦gVæ7F–öâvWEV&Æ–4&6UW&Â‡&WVW7B’°Ğ¢6öç7B6öæf–wW&VBÒ6ÆVåFW‡B‡&ö6W72æVçbåE$4´U%õT$Ä”5õU$Â’ç&WÆ6R‚õÂòBòÂ""“°Ğ¢&WGW&â6öæf–wW&VBÇÂG·&WVW7Bç&÷Fö6öÇÓ¢òòG·&WVW7BævWB‚&†÷7B"—Ö°Ğ§ĞĞ¦gVæ7F–öâFEWFÕ&ÖWFW'2‡&uW&ÂÂ6×–vâÂ&V6—–VçB’°Ğ¢G'’°Ğ¢6öç7BW&ÂÒæWrU$Â‡&uW&Â“°Ğ¢W&Âç6V&6…&×2ç6WB‚'WFÕ÷6÷W&6R"Â&VÖ–Â"“°Ğ¢W&Âç6V&6…&×2ç6WB‚'WFÕöÖVF—VÒ"Â&–çFW&æÅöæöFVÖ–Â"“°Ğ¢W&Âç6V&6…&×2ç6WB‚'WFÕö6×–vâ"Â6×–vâçWFÔ6×–vâ“°Ğ¢W&Âç6V&6…&×2ç6WB‚'WFÕö6öçFVçB"Â&V6—–VçBçFö¶Vâ“°Ğ¢–b‡&V6—–VçBæw&÷W’W&Âç6V&6…&×2ç6WB‚'WFÕ÷FW&Ò"Â&V6—–VçBæw&÷W“°Ğ¢&WGW&âW&ÂçFõ7G&–ær‚“°Ğ¢Ò6F6‚²&WGW&â&uW&Ã²ĞĞ§ĞĞ¦gVæ7F–öâG&6¶VEW&Â‡&uW&ÂÂ6×–vâÂ&V6—–VçBÂ&6UW&Â’²&WGW&âG¶&6UW&ÇÒ÷"òG¶Væ6öFUU$”6ö×öæVçB‡&V6—–VçBçFö¶Vâ—Ó÷W&ÃÒG¶Væ6öFUU$”6ö×öæVçB†FEWFÕ&ÖWFW'2‡&uW&ÂÂ6×–vâÂ&V6—–VçB’—Ö²ĞĞ¦gVæ7F–öâ&WÆ6TÆ–æ·2†6öçFVçBÂ6×–vâÂ&V6—–VçBÂ&6UW&Â’²&WGW&â6öçFVçBç&WÆ6R‚ö‡GG3ó¥ÂõÂõµåÇ3ÃåÂ"•Ò²öv’Â‡W&Â’ÓâG&6¶VEW&Â‡W&ÂÂ6×–vâÂ&V6—–VçBÂ&6UW&Â’“²ĞĞ¦gVæ7F–öâW'6öæÆ—¦R†6öçFVçBÂ&V6—–VçB’²&WGW&â6öçFVçBç&WÆ6R‚÷·µÇ2¦æÖUÇ2§×Òöv’Â&V6—–VçBææÖRÇÂ'F†W&R"’ç&WÆ6R‚÷·µÇ2¦VÖ–ÅÇ2§×Òöv’Â&V6—–VçBæVÖ–Â’ç&WÆ6R‚÷·µÇ2¦w&÷WÇ2§×Òöv’Â&V6—–VçBæw&÷WÇÂ""“²ĞĞ¦gVæ7F–öâW66T‡FÖÂ‡fÇVR’²&WGW&â7G&–ær‡fÇVRóò""’ç&WÆ6R‚õ²cÃåÂ"uÒörÂ†6†&7FW"’Óâ‡²"b#¢"f×²"Â#Â#¢"fÇC²"Â#â#¢"fwC²"Â%Â"#¢"gV÷C²"Â"r#¢"b33“²"Ò•¶6†&7FW%Ò“²ĞĞ¦gVæ7F–öâ‡FÖÅFõFW‡B†‡FÖÂ’°Ğ¢&WGW&â7G&–ær†‡FÖÂóò""’ç&WÆ6R‚óÂÒÕµÇ5Å5Ò£òÒÓâörÂ""’ç&WÆ6R‚óÂ‡67&—GÇ7G–ÆR•Æ%µãåÒ£åµÇ5Å5Ò£óÅÂõÃÇ2£âöv’Â""Ğ¢ç&WÆ6R‚óÅÂò‡ÆF—gÆ…³Óe×ÆÆ—ÇG'Æ&Æö6·V÷FR•Ç2£âöv’Â%ÆåÆâ"’ç&WÆ6R‚óÆ'%Ç2¥ÂóõÇ2£âöv’Â%Æâ"Ğ¢ç&WÆ6R‚óÅµãåÒ³âörÂ""’ç&WÆ6R‚òfæ'7²öv’Â""’ç&WÆ6R‚òf×²öv’Â"b"’ç&WÆ6R‚òfÇC²öv’Â#Â"’ç&WÆ6R‚òfwC²öv’Â#â"Ğ¢ç&WÆ6R‚ògV÷C²öv’ÂuÂ"r’ç&WÆ6R‚òb33“·Âf÷3²öv’Â"r"’ç&WÆ6R‚òb2…ÆB²“²örÂ†ÖF6‚Â6öFR’Óâ²6öç7BfÇVRÒçVÖ&W"†6öFR“²&WGW&âfÇVRÃÒƒfffbò7G&–æræg&öÔ6öFUö–çB‡fÇVR’¢ÖF6ƒ²ÒĞ¢ç&WÆ6R‚õ²ÇEÒ²örÂ""’ç&WÆ6R‚ò¥Æâ¢örÂ%Æâ"’ç&WÆ6R‚õÆç³2ÇÒörÂ%ÆåÆâ"’çG&–Ò‚“°Ğ§ĞĞ¦gVæ7F–öâ6×–våÆ–åFW‡B†&öG’’²&WGW&â6ÆVåFW‡B†&öG’çÆ–åFW‡B’ÇÂ‡FÖÅFõFW‡B†&öG’æ‡FÖÄ&öG’ÇÂ&öG’æ‡FÖÅ&Wf–WrÇÂ""“²ĞĞ¦gVæ7F–öâW'6öæÆ—¦T‡FÖÂ†6öçFVçBÂ6×–vâÂ&V6—–VçB’°Ğ¢ÆWB‡FÖÂÒ7G&–ær†6öçFVçBÇÂ""’ç6Æ–6RƒÂSóĞ¢ç&WÆ6R‚óÅÇ2¢‡67&—GÆ–g&ÖWÆö&¦V7GÆVÖ&VB•Æ%µãåÒ£åµÇ5Å5Ò£óÅÂõÇ2¥ÃÇ2£âöv’Â""Ğ¢ç&WÆ6R‚õÇ2¶öå¶×¥ÒµÇ2£ÕÇ2¢ƒó¢%µâ%Ò¢'ÂuµâuÒ¢wÅµåÇ3åÒ²’öv’Â""Ğ¢ç&WÆ6R‚ò†‡&VgÇ7&2•Ç2£ÕÇ2¢…²"uÒ•Ç2¦¦f67&—C¥µÇ5Å5Ò£õÃ"öv’ÂrCÒ"2"r“°Ğ¢‡FÖÂÒ‡FÖÂç&WÆ6R‚÷·µÇ2¦6öÆÆV7F–öå÷W&ÅÇ2§×Òöv’ÂW66T‡FÖÂ†6×–vâæ6öÆÆV7F–öåW&ÂÇÂ""’Ğ¢ç&WÆ6R‚÷·µÇ2¦æÖUÇ2§×Òöv’ÂW66T‡FÖÂ‡&V6—–VçBææÖRÇÂ'F†W&R"’Ğ¢ç&WÆ6R‚÷·µÇ2¦VÖ–ÅÇ2§×Òöv’ÂW66T‡FÖÂ‡&V6—–VçBæVÖ–Â’Ğ¢ç&WÆ6R‚÷·µÇ2¦w&÷WÇ2§×Òöv’ÂW66T‡FÖÂ‡&V6—–VçBæw&÷WÇÂ""’“°Ğ¢&WGW&â‡FÖÂç&WÆ6R‚óÆÆ"…µãåÒ£ò•Æ&‡&VeÇ2£ÕÇ2¢…²"uÒ’‚â£ò•Ã"…µãåÒ¢“âöv’Â†ÖF6‚Â&Vf÷&RÂV÷FRÂVæ6öFVEW&ÂÂgFW"’Óâ°Ğ¢6öç7BFW7F–æF–öâÒ6fTFW7F–æF–öâ†Væ6öFVEW&Âç&WÆ6R‚òf×²öv’Â"b"’ç&WÆ6R‚òb3£3ƒ²öv’Â"b"’“°Ğ¢–b‚FW7F–æF–öâ’&WGW&âÖF6ƒ°Ğ¢&WGW&âÆG¶&Vf÷&WÖ‡&VcÒG·V÷FWÒG¶W66T‡FÖÂ‡G&6¶VEW&Â†FW7F–æF–öâÂ6×–vâÂ&V6—–VçBÂ6×–vâçG&6¶W$&6UW&Â’—ÒG·V÷FWÒG¶gFW'Óæ°Ğ¢Ò“°Ğ§ĞĞ¦gVæ7F–öâ6ö×÷6U&V6—–VçEFW‡B†6×–vâÂ&V6—–VçB’°Ğ¢6öç7Bv—F„6öÆÆV7F–öâÒ6×–vâçÆ–åFW‡Bç&WÆ6R‚÷·µÇ2¦6öÆÆV7F–öå÷W&ÅÇ2§×Òöv’Â6×–vâæ6öÆÆV7F–öåW&ÂÇÂ""“°Ğ¢6öç7B&öG’ÒW'6öæÆ—¦R‡v—F„6öÆÆV7F–öâÂ&V6—–VçB“°Ğ¢6öç7Bw&VWF–ærÒ6×–vâæFDw&VWF–ærbb&V6—–VçBææÖRòFV"G·&V6—–VçBææÖWÒÅÆåÆæ¢"#°Ğ¢&WGW&â&WÆ6TÆ–æ·2†G¶w&VWF–æwÒG¶&öG—ÖÂ6×–vâÂ&V6—–VçBÂ6×–vâçG&6¶W$&6UW&Â“°Ğ§ĞĞ¦gVæ7F–öâ6fTFW7F–æF–öâ‡fÇVR’²G'’²6öç7BW&ÂÒæWrU$Â‡fÇVR“²&WGW&â²&‡GG¢"Â&‡GG3¢%Òæ–æ6ÇVFW2‡W&Âç&÷Fö6öÂ’òW&ÂçFõ7G&–ær‚’¢çVÆÃ²Ò6F6‚²&WGW&âçVÆÃ²ÒĞĞ¦gVæ7F–öâvWE6×G6öæf–r†Væ7'—FVB’²&WGW&â6×G6WGF–æw2æFV7'—B†Væ7'—FVBÇÂ6Æ÷VBæ7W'&VçB‚“òç6×G’ÇÂ6×G6WGF–æw2æVçf—&öæÖVçB‚“²ĞĞ¦gVæ7F–öâvWEG&ç7÷'FW"†Væ7'—FVB’°Ğ¢6öç7B6öæf–rÒvWE6×G6öæf–r†Væ7'—FVB“°Ğ¢6öç7B†÷7BÒ6ÆVåFW‡B†6öæf–ræ†÷7B’ÂW6W"Ò6ÆVåFW‡B†6öæf–rçW6W"’Â77v÷&BÒ6öæf–rç77v÷&C°Ğ¢–b‚†÷7BÇÂW6W"ÇÂ77v÷&B’F‡&÷ræWrW'&÷"‚%F†«÷R4ÕEô„õ5BÂ4ÕEõU4U"†ş«v24ÕEõ52G&öærf–ÆRæVçbâ"“°Ğ¢–b‚÷–÷W"ÖFöÖ–çÇ&WÆ6R×v—F‚ö’çFW7B†G·W6W'ÒG·77v÷&GÖ’’F‡&÷ræWrW'&÷"‚%4ÕEnª¶âL;–ærFŒ;FærF–âŞª·RâŒ:7’I¸â&«öâÜ;F’G,k¹Öær4ÕEº7Î¸râ"“°Ğ¢&WGW&âæöFVÖ–ÆW"æ7&VFUG&ç7÷'B‡²†÷7BÂ÷'C¢6öæf–rç÷'BÂ6V7W&S¢6öæf–rç6V7W&RÂ&WV—&UDÅ3¢6öæf–rç6V7W&RÀĞ¢g&öÓ¢6öæf–ræg&öÒÇÂW6W"Â6öææV7F–öåF–ÖV÷WC¢SÂw&VWF–æuF–ÖV÷WC¢SÂ6ö6¶WEF–ÖV÷WC¢#SÂWFƒ¢²W6W"Â73¢77v÷&BÒÒ“°Ğ§ĞĞ¦gVæ7F–öâ&V6—–VçE–ÆöB‚’°Ğ¢6öç7Bw&÷W2Ò·Ó°Ğ¢FF&6Rç&V6—–VçG2æf÷$V6‚‚‡&V6—–VçB’Óâ²w&÷W5·&V6—–VçBæw&÷WÇÂ$6ŒkŒ:&âÆşª’%ÒÒ†w&÷W5·&V6—–VçBæw&÷WÇÂ$6ŒkŒ:&âÆşª’%ÒÇÂ’²²Ò“°Ğ¢&WGW&â²&V6—–VçG3¢FF&6Rç&V6—–VçG2Âw&÷W2Ó°Ğ§ĞĞ¦gVæ7F–öâ—5&V6VçFÇ•6VçE6ÖT6öçFVçB†VÖ–ÂÂf–ævW'&–çB’°Ğ¢6öç7B7WFöfbÒFFRææ÷r‚’ÒGWÆ–6FUv–æF÷t×3°Ğ¢&WGW&âFF&6Ræ6×–vç2ç6öÖR‚†6×–vâ’Óâ6×–vâæ6öçFVçD†6‚ÓÓÒf–ævW'&–çBbb6×–vâç&V6—–VçG2ç6öÖR‚‡&V6—–VçB’Óâ&V6—–VçBæVÖ–ÂÓÓÒVÖ–Âbb&V6—–VçBç7FGW2ÓÓÒ'6VçB"bbFFRç'6R‡&V6—–VçBç6VçDB’ãÒ7WFöfb’“°Ğ§ĞĞ¦gVæ7F–öâ6×–vå7VÖÖ'’†6×–vâ’°Ğ¢6öç7BWfVçG2ÒFF&6RæWfVçG2æf–ÇFW"‚†WfVçB’ÓâWfVçBæ6×–vä–BÓÓÒ6×–vâæ–B“°Ğ¢6öç7BVæ—VT'”WfVçBÒ‡G—R’ÓâæWr6WB†WfVçG2æf–ÇFW"‚†WfVçB’ÓâWfVçBçG—RÓÓÒG—R’æÖ‚†WfVçB’ÓâWfVçBçFö¶Vâ’’ç6—¦S°Ğ¢6öç7B6÷VçBÒ‡7FGW2’Óâ6×–vâç&V6—–VçG2æf–ÇFW"‚‡&V6—–VçB’Óâ&V6—–VçBç7FGW2ÓÓÒ7FGW2’æÆVæwFƒ°Ğ¢&WGW&â°Ğ¢–C¢6×–vâæ–BÂ7V&¦V7C¢6×–vâç7V&¦V7BÂ7&VFVDC¢6×–vâæ7&VFVDBÂ7FGW3¢6×–vâç7FGW2ÇÂ&6ö×ÆWFVB"ÂæW‡E6VæDC¢6×–vâææW‡E6VæDBÇÂçVÆÂÂ6ö×ÆWFVDC¢6×–vâæ6ö×ÆWFVDBÇÂçVÆÂÀĞ¢F÷FÃ¢6×–vâç&V6—–VçG2æÆVæwF‚ÂVWVVC¢6÷VçB‚'VWVVB"’Â6VæF–æs¢6÷VçB‚'6VæF–ær"’Â6VçC¢6÷VçB‚'6VçB"’Âf–ÆVC¢6÷VçB‚&f–ÆVB"’Â&Æö6¶VC¢6÷VçB‚&&Æö6¶VB"’ÀĞ¢&öw&W75W&6VçC¢6×–vâç&V6—–VçG2æÆVæwF‚òÖF‚ç&÷VæB‚†6÷VçB‚'6VçB"’²6÷VçB‚&f–ÆVB"’²6÷VçB‚&&Æö6¶VB"’’¢ò6×–vâç&V6—–VçG2æÆVæwF‚’¢ÀĞ¢7W'&VçDVÖ–Ã¢6×–vâç&V6—–VçG2æf–æB‚‡&V6—–VçB’Óâ&V6—–VçBç7FGW2ÓÓÒ'6VæF–ær"“òæVÖ–ÂÇÂ""ÀĞ¢Æ7E6VçDVÖ–Ã¢6×–vâç&V6—–VçG2æf–ÇFW"‚‡&V6—–VçB’Óâ&V6—–VçBç7FGW2ÓÓÒ'6VçB"’ç6÷'B‚†Â"’ÓâFFRç'6R†"ç6VçDBÇÂ’ÒFFRç'6R†ç6VçDBÇÂ’•³ÓòæVÖ–ÂÇÂ""ÀĞ¢Æ7E6VçDC¢6×–vâç&V6—–VçG2æf–ÇFW"‚‡&V6—–VçB’Óâ&V6—–VçBç7FGW2ÓÓÒ'6VçB"’ç6÷'B‚†Â"’ÓâFFRç'6R†"ç6VçDBÇÂ’ÒFFRç'6R†ç6VçDBÇÂ’•³Óòç6VçDBÇÂçVÆÂÀĞ¢6Æ–6¶VC¢Væ—VT'”WfVçB‚&6Æ–6²"’ÂFFVEFô6'C¢Væ—VT'”WfVçB‚&FE÷Fõö6'B"’Â6†V6¶÷WC¢Væ—VT'”WfVçB‚&&Vv–åö6†V6¶÷WB"’ÂW&6†6VC¢Væ—VT'”WfVçB‚'W&6†6R"’ÀĞ¢Ó°Ğ§ĞĞ¦6öç7BWfVçDÆ&VÂÒ‡G—R’Óâ‡²6Æ–6³¢,I:2.ªVÒÆ–æ²"ÂFE÷Fõö6'C¢,I:2FŒ:¦Òv¸ò"Â&Vv–åö6†V6¶÷WC¢,I:26†V6¶÷WB"ÂW&6†6S¢,I:2×VŒ:ær"Âf–WuöÆ–æ³¢,I:2†VÒÆ–æ²"Ò•·G—UÒÇÂG—S°Ğ Ğ¦ÆWBv÷&¶W%F–ÖW"ÒçVÆÃ°Ğ¦ÆWBv÷&¶W$'W7’ÒfÇ6S°Ğ¦gVæ7F–öâ6ÆV%v÷&¶W%F–ÖW"‚’²–b‡v÷&¶W%F–ÖW"’6ÆV%F–ÖV÷WB‡v÷&¶W%F–ÖW"“²v÷&¶W%F–ÖW"ÒçVÆÃ²ĞĞ¦gVæ7F–öâ66†VGVÆUv÷&¶W"†FVÆ”×2Ò’°Ğ¢–b†6Æ÷VBæVæ&ÆVB’²6Æ÷VBç66†VGVÆR†FVÆ”×2“²&WGW&ã²ĞĞ¢6ÆV%v÷&¶W%F–ÖW"‚“°Ğ¢v÷&¶W%F–ÖW"Ò6WEF–ÖV÷WB‚‚’Óâ²v÷&¶W%F–ÖW"ÒçVÆÃ²'VåVWVR‚’æ6F6‚‚†W'&÷"’Óâ6öç6öÆRæW'&÷"‚%VWVRW'&÷#¢"ÂW'&÷"’“²ÒÂÖF‚æÖ‚†FVÆ”×2Â’“°Ğ§ĞĞ¦gVæ7F–öâf–æ—6„6×–vä–dFöæR†6×–vâ’°Ğ¢–b‚6×–vâç&V6—–VçG2ç6öÖR‚‡&V6—–VçB’Óâ²'VWVVB"Â'6VæF–ær%Òæ–æ6ÇVFW2‡&V6—–VçBç7FGW2’’’°Ğ¢6×–vâç7FGW2Ò&6ö×ÆWFVB#°Ğ¢6×–vâæ6ö×ÆWFVDBÒ6×–vâæ6ö×ÆWFVDBÇÂæWrFFR‚’çFô•4õ7G&–ær‚“°Ğ¢6×–vâææW‡E6VæDBÒçVÆÃ°Ğ¢ĞĞ§ĞĞ¦7–æ2gVæ7F–öâ'VåVWVR‚’°Ğ¢–b‡v÷&¶W$'W7’’&WGW&ã°Ğ¢6öç7B6×–vâÒFF&6Ræ6×–vç2æf–æB‚†—FVÒ’Óâ—FVÒç7FGW2ÓÓÒ''Vææ–ær"“°Ğ¢–b‚6×–vâ’&WGW&ã°Ğ¢6öç7B&V6—–VçBÒ6×–vâç&V6—–VçG2æf–æB‚†—FVÒ’Óâ—FVÒç7FGW2ÓÓÒ'VWVVB"“°Ğ¢–b‚&V6—–VçB’²f–æ—6„6×–vä–dFöæR†6×–vâ“²6fTFF&6R‚“²66†VGVÆUv÷&¶W"ƒ“²&WGW&ã²ĞĞ¢6öç7Bv—EVçF–ÂÒFFRç'6R†6×–vâææW‡E6VæDBÇÂ""“°Ğ¢–b„çVÖ&W"æ—4f–æ—FR‡v—EVçF–Â’bbv—EVçF–ÂâFFRææ÷r‚’’²66†VGVÆUv÷&¶W"‡v—EVçF–ÂÒFFRææ÷r‚’“²&WGW&ã²ĞĞ¢v÷&¶W$'W7’ÒG'VS°Ğ¢&V6—–VçBç7FGW2Ò'6VæF–ær#°Ğ¢6fTFF&6R‚“°Ğ¢G'’°Ğ¢6öç7BG&ç7÷'FW"ÒvWEG&ç7÷'FW"‚“°Ğ¢6öç7BG&6¶W$&6UW&ÂÒ6×–vâçG&6¶W$&6UW&Ã°Ğ¢v—BG&ç7÷'FW"ç6VæDÖ–Â‡°Ğ¢g&öÓ¢&ö6W72æVçbå4ÕEôe$ôÒÇÂ&ö6W72æVçbå4ÕEõU4U"ÀĞ¢Fó¢&V6—–VçBæVÖ–ÂÀĞ¢7V&¦V7C¢W'6öæÆ—¦R†6×–vâç7V&¦V7BÂ&V6—–VçB’ÀĞ¢FW‡C¢6ö×÷6U&V6—–VçEFW‡B†6×–vâÂ&V6—–VçB’ÀĞ¢âââ†6×–vâæ‡FÖÄ&öG’ò²‡FÖÃ¢W'6öæÆ—¦T‡FÖÂ†6×–vâæ‡FÖÄ&öG’Â6×–vâÂ&V6—–VçB’Ò¢·Ò’ÀĞ¢Ò“°Ğ¢&V6—–VçBç7FGW2Ò'6VçB#°Ğ¢&V6—–VçBç6VçDBÒæWrFFR‚’çFô•4õ7G&–ær‚“°Ğ¢G'’°Ğ¢6öç7B†—7F÷'’ÒÆöE6VçD†—7F÷'’‡6VçD†—7F÷'”f–ÆR“°Ğ¢&V6÷&E6VçB††—7F÷'’Â²VÖ–Ã¢&V6—–VçBæVÖ–ÂÂ6ÇV#¢&V6—–VçBæw&÷WÂ7V&¦V7C¢W'6öæÆ—¦R†6×–vâç7V&¦V7BÂ&V6—–VçB’Â&öG“¢6ö×÷6U&V6—–VçEFW‡B†6×–vâÂ&V6—–VçB’Â6VçDC¢&V6—–VçBç6VçDBÂgVææVÃ¢6×–vâægVææVÂÇÂ6×–vâçG—RÇÂ""Ò“°Ğ¢6fU6VçD†—7F÷'’‡6VçD†—7F÷'”f–ÆRÂ†—7F÷'’“°Ğ¢Ò6F6‚††—7F÷'”W'&÷"’°Ğ¢&V6—–VçBæ†—7F÷'”W'&÷"ÒVÖ–ÂI:2~ºÖ“²v†’6VçEö†—7F÷'’FªWB.ª“¢G¶†—7F÷'”W'&÷"æÖW76vWÖ°Ğ¢6öç6öÆRæW'&÷"‡&V6—–VçBæ†—7F÷'”W'&÷"“°Ğ¢ĞĞ¢Ò6F6‚†W'&÷"’°Ğ¢&V6—–VçBç7FGW2Ò&f–ÆVB#°Ğ¢&V6—–VçBæW'&÷"ÒW'&÷"æÖW76vS°Ğ¢Òf–æÆÇ’°Ğ¢v÷&¶W$'W7’ÒfÇ6S°Ğ¢ĞĞ¢–b†6×–vâç7FGW2ÓÓÒ''Vææ–ær"’°Ğ¢f–æ—6„6×–vä–dFöæR†6×–vâ“°Ğ¢–b†6×–vâç7FGW2ÓÓÒ''Vææ–ær"’6×–vâææW‡E6VæDBÒæWrFFR„FFRææ÷r‚’²&æFöÔFVÆ’‚’’çFô•4õ7G&–ær‚“°Ğ¢ĞĞ¢6fTFF&6R‚“°Ğ¢–b†6×–vâç7FGW2ÓÓÒ''Vææ–ær"’66†VGVÆUv÷&¶W"„FFRç'6R†6×–vâææW‡E6VæDB’ÒFFRææ÷r‚’“°Ğ¢VÇ6R66†VGVÆUv÷&¶W"ƒ“°Ğ§ĞĞ Ğ¦gVæ7F–öâ'6U&V6—–VçEv÷&¶&öö²†'VffW"Âf÷&6VDw&÷WÒ""’°Ğ¢ÆWBv÷&¶&öö³°Ğ¢G'’²v÷&¶&öö²Ò„Å5‚ç&VB†'VffW"Â²G—S¢&'VffW""Â&s¢fÇ6RÒ“²Ò6F6‚²F‡&÷ræWrW'&÷"‚$¶Œ;FærF¸2I¸Ö2f–ÆR.ª6ærL:Öæ‚ì:’â"“²ĞĞ¢6öç7B–×÷'FVBÒµÒÂ–çfÆ–E&÷w2ÒµÒÂW†—7F–ærÒæWr6WB†FF&6Rç&V6—–VçG2æÖ‚‡&V6—–VçB’Óâ&V6—–VçBæVÖ–ÂçFôÆ÷vW$66R‚’’“°Ğ¢f÷"†6öç7B6†VWDæÖRöbv÷&¶&öö²å6†VWDæÖW2’°Ğ¢6öç7B&÷w2Ò„Å5‚çWF–Ç2ç6†VWE÷Fõö§6öâ‡v÷&¶&öö²å6†VWG5·6†VWDæÖUÒÂ²FVgfÃ¢""Â&s¢fÇ6RÒ“°Ğ¢–b‚&÷w2æÆVæwF‚’6öçF–çVS°Ğ¢6öç7B†VFW'2Òö&¦V7Bæ¶W—2‡&÷w5³Ò“°Ğ¢6öç7BVÖ–Ä6öÇVÖâÒ6öÇVÖä'•&–÷&—G’††VFW'2Â²&VÖ–Â"Â&Ö–Â"Â&VÖ–ÆFG&W72%Ò“°Ğ¢–b‚VÖ–Ä6öÇVÖâ’6öçF–çVS°Ğ¢6öç7Bw&÷W6öÇVÖâÒ6öÇVÖä'•&–÷&—G’††VFW'2Â²'FVÒ"Â&w&÷W"Â'6VvÖVçB"Â&6ÇV""Â&Fö’"Â&æ†öÒ"Â&6FVv÷'’%Ò“°Ğ¢6öç7BæÖT6öÇVÖâÒ†VFW'2æf–æB‚††VFW"’Óâ²&æÖR"Â&gVÆÆæÖR"Â&7W7FöÖW&æÖR"Â&f—'7FæÖR"Â&7W7FöÖW&f—'7B"Â&7W7FöÖW&f—'7FæÖR"Â'FVâ"Â'FVæ¶†6††ær%Òæ–æ6ÇVFW2†æ÷&ÖÆ—¦VD†VFW"††VFW"’’“°Ğ¢&÷w2æf÷$V6‚‚‡&÷rÂ–æFW‚’Óâ°Ğ¢6öç7BVÖ–ÂÒ6ÆVåFW‡B‡&÷u¶VÖ–Ä6öÇVÖåÒ’çFôÆ÷vW$66R‚“°Ğ¢–b‚VÖ–Â’&WGW&ã°Ğ¢–b‚—4VÖ–Â†VÖ–Â’’²–çfÆ–E&÷w2çW6‚‡²6†VWC¢6†VWDæÖRÂ&÷s¢–æFW‚²"Ò“²&WGW&ã²ĞĞ¢–b†W†—7F–æræ†2†VÖ–Â’’&WGW&ã°Ğ¢W†—7F–æræFB†VÖ–Â“°Ğ¢–×÷'FVBçW6‚‡²–C¢æWt–B‚'&V6—–VçB"’ÂVÖ–ÂÂæÖS¢æÖT6öÇVÖâò6ÆVåFW‡B‡&÷u¶æÖT6öÇVÖåÒ’¢""Âw&÷W¢f÷&6VDw&÷WÇÂ†w&÷W6öÇVÖâò6ÆVåFW‡B‡&÷u¶w&÷W6öÇVÖåÒ’ÇÂ$6ŒkŒ:&âÆşª’"¢6†VWDæÖR’Â6÷W&6U6†VWC¢6†VWDæÖRÂ7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’Ò“°Ğ¢Ò“°Ğ¢ĞĞ¢–b‚–ß6ÖÚ$z{-®éÜj×–wW&VB†6öæf–rĞ¢ÇÂ6öæf–rç77v÷&BæÆVæwF‚âC“bÇÂõµÇ%ÆåÒòçFW7B†6öæf–ræg&öÒ’’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢,I¸â†÷7BÂ>¹VærCcRóSƒrÂVÖ–Âl:Şª×B¶ª—R4ÕEº7Î¸râ"Ò“°Ğ¢6Æ÷VBæ7W'&VçB‚’ç6×GÒ6×G6WGF–æw2æVæ7'—B†6öæf–r“°Ğ¢6Æ÷VBæF—'G’‚“°Ğ¢&W7öç6Ræ§6öâ‡²ö³¢G'VRÒ“°Ğ§Ò“°Ğ¦ç÷7B‚"ö’÷6×G×fW&–g’"Â7–æ2…÷&WVW7BÂ&W7öç6R’Óâ°Ğ¢G'’²v—BvWEG&ç7÷'FW"‚’çfW&–g’‚“²&W7öç6Ræ§6öâ‡²ö³¢G'VRÂÖW76vS¢$¾«÷Bî¹’4ÕEFŒ:æ‚<;Færâ6Œk~ºÖ’VÖ–Ââ"Ò“²ĞĞ¢6F6‚†W'&÷"’²&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢¶Œ;Fær¾«÷Bî¹’Ikº624ÕE‚G¶W'&÷"æ6öFRÇÂ$4ôäd”uôU%$õ"'Ò’â¶¸6ÒG&†÷7BÂVÖ–Âl:Şª×B¶ª—R¹—FŒkæÒ“²ĞĞ§Ò“°Ğ¦ævWB‚"ö’÷6WGF–æw2"Â‡&WVW7BÂ&W7öç6R’Óâ&W7öç6Ræ§6öâ‡°Ğ¢G&6¶W$&6UW&Ã¢vWEV&Æ–4&6UW&Â‡&WVW7B’ÂG&6¶W$—5V&Æ–3¢&ööÆVâ‡&ö6W72æVçbåE$4´U%õT$Ä”5õU$Â’bb‚6Æ÷VBæVæ&ÆVBÇÂ&ö6W72æVçbåE$4´U%õT$Ä”5ô44U52ÓÓÒ'G'VR"’ÂvöövÆTÖV7W&VÖVçD–C¢&ö6W72æVçbätEôÔT5U$TÔTåEô”BÇÂ$rÓ#•å£„Uc""ÀĞ¢6×G6öæf–wW&VC¢6×G6WGF–æw2æ6öæf–wW&VB†vWE6×G6öæf–r‚’’Âg&öÓ¢vWE6×G6öæf–r‚’æg&öÒÀĞ¢FVfVÇE&V6—–VçDf–ÆT6öæf–wW&VC¢&ööÆVâ†FVfVÇE&V6—–VçDf–ÆR’ÂFVfVÇE&V6—–VçDf–ÆTæÖS¢FVfVÇE&V6—–VçDf–ÆRòF‚æ&6VæÖR†FVfVÇE&V6—–VçDf–ÆR’¢""ÂFVÆ”Ö–äÖ–çWFW3¢6VæDFVÆ”Ö–ä×2òcóÂFVÆ”Ö„Ö–çWFW3¢6VæDFVÆ”Ö„×2òcóÀĞ§Ò’“°Ğ¦ç÷7B‚"ö’÷&V6—–VçG2ö–×÷'B"ÂWÆöBç6–ævÆR‚&f–ÆR"’Â‡&WVW7BÂ&W7öç6R’Óâ°Ğ¢–b‚&WVW7Bæf–ÆR’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6¸Öâf–ÆRFæ‚<:6‚VÖ–ÂG,k¹¶2¶†’æª×â"Ò“°Ğ¢G'’²&W7öç6Ræ§6öâ‡'6U&V6—–VçEv÷&¶&öö²‡&WVW7Bæf–ÆRæ'VffW"Â6ÆVåFW‡B‡&WVW7BçVW'’æw&÷W’’“²Ò6F6‚†W'&÷"’²&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢W'&÷"æÖW76vRÒ“²ĞĞ§Ò“°Ğ¦ç÷7B‚"ö’÷&V6—–VçG2ö–×÷'B×6÷W&6R"Â…÷&WVW7BÂ&W7öç6R’Óâ°Ğ¢–b‚FVfVÇE&V6—–VçDf–ÆR’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6Œk>ªWRŒ:Ææ‚DTdTÅEõ$T4•”TåE5ôd”ÄRG&öærf–ÆRæVçbâ"Ò“°Ğ¢G'’²&W7öç6Ræ§6öâ‡'6U&V6—–VçEv÷&¶&öö²†g2ç&VDf–ÆU7–æ2†FVfVÇE&V6—–VçDf–ÆR’’“²Ò6F6‚†W'&÷"’²&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢¶Œ;FærF¸2æª×f–ÆRæw^¹6ã¢G¶W'&÷"æÖW76vWÖÒ“²ĞĞ§Ò“°Ğ¦ævWB‚"ö’÷&V6—–VçG2"Â…÷&WVW7BÂ&W7öç6R’Óâ&W7öç6Ræ§6öâ‡&V6—–VçE–ÆöB‚’’“°Ğ¦æFVÆWFR‚"ö’÷&V6—–VçG2"Â…÷&WVW7BÂ&W7öç6R’Óâ²FF&6Rç&V6—–VçG2ÒµÓ²6fTFF&6R‚“²w&—FUFVÔf–ÆW2‚“²&W7öç6Rç7FGW2ƒ#B’æVæB‚“²Ò“°Ğ¦ævWB‚"ö’ö6ÇV"Ö6öÆÆV7F–öç2"Â…÷&WVW7BÂ&W7öç6R’Óâ&W7öç6Ræ§6öâ„4ÅT%ô4ôÄÄT5D”ôå2’“°Ğ¦ævWB‚"ö’÷FV×2"Â…÷&WVW7BÂ&W7öç6R’Óâ°Ğ¢6öç7Bw&÷W2Ò&V6—–VçE–ÆöB‚’æw&÷W3°Ğ¢6öç7B†—7F÷'’ÒÆöE6VçD†—7F÷'’‡6VçD†—7F÷'”f–ÆR“°Ğ¢&W7öç6Ræ§6öâ„ö&¦V7BæVçG&–W2†w&÷W2’ç6÷'B‚†Â"’Óâ³ÒæÆö6ÆT6ö×&R†%³ÒÂ'f’"’’æÖ‚…¶w&÷WÂ6÷VçEÒ’Óâ‡²w&÷WÂ6÷VçBÂ6öÆÆV7F–öåW&Ã¢4ÅT%ô4ôÄÄT5D”ôå5¶w&÷WÒÇÂ""Â6öçFVçE6fVC¢&ööÆVâ†ÆöEFVÔ6öçFVçB†w&÷W’’Â†—7F÷'”6÷VçC¢ö&¦V7BçfÇVW2††—7F÷'’’æf–ÇFW"‚†VçG'’’ÓâVçG'“òæ6ÇV"ÓÓÒw&÷W’æÆVæwF‚Âf–ÆTæÖS¢G·FVÔf–ÆU6ÇVr†w&÷W—Òæ77fÒ’’“°Ğ§Ò“°Ğ¦ævWB‚"ö’÷FVÒÖ6öçFVçB"Â‡&WVW7BÂ&W7öç6R’Óâ°Ğ¢6öç7Bw&÷WÒ6ÆVåFW‡B‡&WVW7BçVW'’æw&÷W“°Ğ¢–b‚w&÷WÇÂw&÷WæÆVæwF‚â’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6¸ÖâŞ¹—BI¹–’º7Î¸râ"Ò“°Ğ¢&W7öç6Ræ§6öâ†ÆöEFVÔ6öçFVçB†w&÷W’ÇÂ²w&÷WÂ7V&¦V7C¢""ÂÆ–åFW‡C¢""Â‡FÖÄ&öG“¢""Â6öÆÆV7F–öåW&Ã¢4ÅT%ô4ôÄÄT5D”ôå5¶w&÷WÒÇÂ""Ò“°Ğ§Ò“°Ğ¦çWB‚"ö’÷FVÒÖ6öçFVçB"Â‡&WVW7BÂ&W7öç6R’Óâ°Ğ¢6öç7Bw&÷WÒ6ÆVåFW‡B‡&WVW7Bæ&öG’æw&÷W“°Ğ¢–b‚w&÷WÇÂw&÷WæÆVæwF‚â’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6¸ÖâŞ¹—BI¹–’º7Î¸râ"Ò“°Ğ¢6öç7B&t6öÆÆV7F–öåW&ÂÒ6ÆVåFW‡B‡&WVW7Bæ&öG’æ6öÆÆV7F–öåW&Â’Â6öÆÆV7F–öåW&ÂÒ&t6öÆÆV7F–öåW&Âò6fTFW7F–æF–öâ‡&t6öÆÆV7F–öåW&Â’¢"#°Ğ¢–b‡&t6öÆÆV7F–öåW&Âbb6öÆÆV7F–öåW&Â’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6öÆÆV7F–öâU$Â>ªvâÌ:Æœ:¦â¾«÷B‡GGö‡GG2º7Î¸râ"Ò“°Ğ¢6öç7B6öçFVçBÒ°Ğ¢w&÷WÀĞ¢7V&¦V7C¢6ÆVå7V&¦V7B‡&WVW7Bæ&öG’ç7V&¦V7B’ç6Æ–6RƒÂ#’ÀĞ¢Æ–åFW‡C¢7G&–ær‡&WVW7Bæ&öG’çÆ–åFW‡Bóò""’ç6Æ–6RƒÂó’ÀĞ¢‡FÖÄ&öG“¢7G&–ær‡&WVW7Bæ&öG’æ‡FÖÄ&öG’óò&WVW7Bæ&öG’æ‡FÖÅ&Wf–Wróò""’ç6Æ–6RƒÂSó’ÀĞ¢6öÆÆV7F–öåW&ÂÀĞ¢WFFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’ÀĞ¢Ó°Ğ¢–b†6Æ÷VBæ7W'&VçB‚’’²6Æ÷VBæ7W'&VçB‚’çFVÔ6öçFVçE·FVÔf–ÆU6ÇVr†w&÷W•ÒÒ6öçFVçC²6Æ÷VBæF—'G’‚“²ĞĞ¢VÇ6Rg2çw&—FTf–ÆU7–æ2‡&W6öÇfUFVÔ6öçFVçDf–ÆR†w&÷W’Â¥4ôâç7G&–æv–g’†6öçFVçBÂçVÆÂÂ"’Â'WFc‚"“°Ğ¢&W7öç6Ræ§6öâ‡²ö³¢G'VRÂw&÷W¢6öçFVçBæw&÷WÂWFFVDC¢6öçFVçBçWFFVDBÒ“°Ğ§Ò“°Ğ¦ævWB‚"ö’÷FV×2öW‡÷'B"Â‡&WVW7BÂ&W7öç6R’Óâ°Ğ¢6öç7Bw&÷WÒ6ÆVåFW‡B‡&WVW7BçVW'’æw&÷W“°Ğ¢–b‚w&÷W’&WGW&â&W7öç6Rç7FGW2ƒC’ç6VæB‚$6¸ÖâI¹–’>ªvâ‡^ªWBâ"“°Ğ¢6öç7B&÷w2ÒFF&6Rç&V6—–VçG2æf–ÇFW"‚‡&V6—–VçB’Óâ&V6—–VçBæw&÷WÓÓÒw&÷W“°Ğ¢–b‚&÷w2æÆVæwF‚’&WGW&â&W7öç6Rç7FGW2ƒCB’ç6VæB‚,I¹–’ì:’6Œk<;2VÖ–Ââ"“°Ğ¢6öç7BV÷FRÒ‡fÇVR’Óâ"Gµ7G&–ær‡fÇVRóò""’ç&WÆ6R‚ò"örÂr""r—Ò&°Ğ¢6öç7B77bÒ²$VÖ–ÂÄæÖRÅFVÒ"Âââç&÷w2æÖ‚‡&V6—–VçB’Óâ·&V6—–VçBæVÖ–ÂÂ&V6—–VçBææÖRÂ&V6—–VçBæw&÷WÒæÖ‡V÷FR’æ¦ö–â‚"Â"’•Òæ¦ö–â‚%Ç%Æâ"“°Ğ¢&W7öç6Rç6WD†VFW"‚$6öçFVçBÕG—R"Â'FW‡Bö77c²6†'6WC×WFbÓ‚"“°Ğ¢&W7öç6Rç6WD†VFW"‚$6öçFVçBÔF—7÷6—F–öâ"ÂGF6†ÖVçC²f–ÆVæÖSÒ"G·FVÔf–ÆU6ÇVr†w&÷W—Òæ77b&“°Ğ¢&W7öç6Rç6VæB†ÇVfVfbG¶77gÖ“°Ğ§Ò“°Ğ Ğ¦gVæ7F–öâ6×–vå&WVW7FVE&V6—–VçG2†&öG’ÂW'6—7DÖçVÂÒfÇ6R’°Ğ¢6öç7B6VÆV7FVDw&÷W2Ò'&’æ—4'&’†&öG’æw&÷W2’ò&öG’æw&÷W2æÖ†6ÆVåFW‡B’æf–ÇFW"„&ööÆVâ’¢µÓ°Ğ¢–b‡6VÆV7FVDw&÷W2æÆVæwF‚â’F‡&÷ræWrW'&÷"‚$~ºÖ’Nº¶ærI¹–’Ş¹—BI¸2L;–ærI;¦ærî¹–’GVær&œ:¦ær>ºvNº¶ærI¹–’â"“°Ğ¢ÆWB&WVW7FVBÒFF&6Rç&V6—–VçG2æf–ÇFW"‚‡&V6—–VçB’Óâ6VÆV7FVDw&÷W2æ–æ6ÇVFW2‡&V6—–VçBæw&÷W’“°Ğ¢6öç7B&tÖçVÂÒ7G&–ær†&öG’æÖçVÄVÖ–Ç2óò""’ç7Æ—B‚õµÇ%ÆâÃµÇBÒ²ò’æÖ‚†VÖ–Â’ÓâVÖ–ÂçG&–Ò‚’çFôÆ÷vW$66R‚’’æf–ÇFW"„&ööÆVâ“°Ğ¢6öç7B–çfÆ–DÖçVÂÒ&tÖçVÂæf–ÇFW"‚†VÖ–Â’Óâ—4VÖ–Â†VÖ–Â’“°Ğ¢–b†–çfÆ–DÖçVÂæÆVæwF‚’F‡&÷ræWrW'&÷"†<;2G¶–çfÆ–DÖçVÂæÆVæwF‡ÒI¸¶6¸’VÖ–Âæª×F’¶Œ;Færº7Î¸ræ“°Ğ¢6öç7BVæ—VTÖçVÂÒ²ââææWr6WB‡&tÖçVÂ•Ó°Ğ¢f÷"†6öç7BVÖ–ÂöbVæ—VTÖçVÂ’°Ğ¢6öç7BW†—7G4–å&WVW7FVBÒ&WVW7FVBç6öÖR‚‡&V6—–VçB’Óâ&V6—–VçBæVÖ–ÂçFôÆ÷vW$66R‚’ÓÓÒVÖ–Â“°Ğ¢–b†W†—7G4–å&WVW7FVB’6öçF–çVS°Ğ¢ÆWBW†—7F–ærÒFF&6Rç&V6—–VçG2æf–æB‚‡&V6—–VçB’Óâ&V6—–VçBæVÖ–ÂçFôÆ÷vW$66R‚’ÓÓÒVÖ–Â“°Ğ¢–b‚W†—7F–ær’°Ğ¢W†—7F–ærÒ²–C¢æWt–B‚'&V6—–VçB"’ÂVÖ–ÂÂæÖS¢""Âw&÷W¢6VÆV7FVDw&÷W5³ÒÇÂ$Fæ‚<:6‚æª×F’"Â6÷W&6U6†VWC¢&ÖçVÂ"Â7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’Ó°Ğ¢–b‡W'6—7DÖçVÂ’FF&6Rç&V6—–VçG2çW6‚†W†—7F–ær“°Ğ¢ĞĞ¢&WVW7FVBçW6‚†W†—7F–ær“°Ğ¢ĞĞ¢6öç7BFVGWVBÒ²ââææWrÖ‡&WVW7FVBæÖ‚‡&V6—–VçB’Óâ·&V6—–VçBæVÖ–ÂçFôÆ÷vW$66R‚’Â&V6—–VçEÒ’’çfÇVW2‚•Ó°Ğ¢&WGW&â²&WVW7FVC¢FVGWVBÂ6VÆV7FVDw&÷W2ÂÖçVÄ6÷VçC¢Væ—VTÖçVÂæÆVæwF‚Ó°Ğ§ĞĞ¦gVæ7F–öâ–ç7V7D6×–väGWÆ–6FW2†&öG’Â&V6—–VçG2’°Ğ¢6öç7B†—7F÷'’Ò7&VFT†—7F÷'”–æFW‚†ÆöE6VçD†—7F÷'’‡6VçD†—7F÷'”f–ÆR’“°Ğ¢6öç7B6öÆÆV7F–öåW&ÂÒ6fTFW7F–æF–öâ†6ÆVåFW‡B†&öG’æ6öÆÆV7F–öåW&Â’’ÇÂ"#°Ğ¢&WGW&â&V6—–VçG2æÖ‚‡&V6—–VçB’Óâ°Ğ¢6öç7B6×–vâÒ²Æ–åFW‡C¢6×–våÆ–åFW‡B†&öG’’ç&WÆ6R‚÷·µÇ2¦6öÆÆV7F–öå÷W&ÅÇ2§×Òöv’Â6öÆÆV7F–öåW&Â’ÂFDw&VWF–æs¢&öG’æFDw&VWF–ærÓÒfÇ6RÂG&6¶W$&6UW&Ã¢""ÂWFÔ6×–vã¢""Ó°Ğ¢6öç7Bf–æÄ&öG’ÒW'6öæÆ—¦R†6×–vâçÆ–åFW‡BÂ&V6—–VçB“°Ğ¢6öç7Bw&VWF–ærÒ6×–vâæFDw&VWF–ærbb&V6—–VçBææÖRòFV"G·&V6—–VçBææÖWÒÅÆåÆæ¢"#°Ğ¢6öç7B&W7VÇBÒ–ç7V7DGWÆ–6FR††—7F÷'’Â&V6—–VçBæVÖ–ÂÂW'6öæÆ—¦R†6ÆVå7V&¦V7B†&öG’ç7V&¦V7B’Â&V6—–VçB’ÂG¶w&VWF–æwÒG¶f–æÄ&öG—Ö“°Ğ¢&W7VÇBç&V6VçD6×–vâÒ—5&V6VçFÇ•6VçE6ÖT6öçFVçB‡&V6—–VçBæVÖ–ÂÂ6öçFVçDf–ævW'&–çB†6ÆVå7V&¦V7B†&öG’ç7V&¦V7B’Â6×–vâçÆ–åFW‡B’“°Ğ¢&W7VÇBæ—4GWÆ–6FRÒ&W7VÇBæ—4GWÆ–6FRÇÂ&W7VÇBç&V6VçD6×–vã°Ğ¢&WGW&â²VÖ–Ã¢&V6—–VçBæVÖ–ÂÂw&÷W¢&V6—–VçBæw&÷WÂââç&W7VÇBÓ°Ğ¢Ò“°Ğ§ĞĞ¦ç÷7B‚"ö’ö6×–vç2÷&Wf–Wr"Â‡&WVW7BÂ&W7öç6R’Óâ°Ğ¢6öç7B7V&¦V7BÒ6ÆVå7V&¦V7B‡&WVW7Bæ&öG’ç7V&¦V7B’ÂÆ–åFW‡BÒ6×–våÆ–åFW‡B‡&WVW7Bæ&öG’“°Ğ¢–b‚7V&¦V7BÇÂÆ–åFW‡B’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$>ªvâ<;2Fœ:§RI¸l:î¹–’GVær…DÔÂâ"Ò“°Ğ¢6öç7B&t6öÆÆV7F–öåW&ÂÒ6ÆVåFW‡B‡&WVW7Bæ&öG’æ6öÆÆV7F–öåW&Â’Â6öÆÆV7F–öåW&ÂÒ&t6öÆÆV7F–öåW&Âò6fTFW7F–æF–öâ‡&t6öÆÆV7F–öåW&Â’¢"#°Ğ¢–b‡&t6öÆÆV7F–öåW&Âbb6öÆÆV7F–öåW&Â’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6öÆÆV7F–öâU$Â>ªvâÌ:Æœ:¦â¾«÷B‡GGö‡GG2º7Î¸râ"Ò“°Ğ¢–b‚÷·µÇ2¦6öÆÆV7F–öå÷W&ÅÇ2§×Òö’çFW7B†G·Æ–åFW‡GÕÆâG·&WVW7Bæ&öG’æ‡FÖÄ&öG’ÇÂ"'Ö’bb6öÆÆV7F–öåW&Â’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$î¹–’GVærIær<;2·¶6öÆÆV7F–öå÷W&Ç×ÒæŒkær6Œk6¸ÖâöL:â6öÆÆV7F–öâU$Ââ"Ò“°Ğ¢ÆWBVF–Væ6S°Ğ¢G'’²VF–Væ6RÒ6×–vå&WVW7FVE&V6—–VçG2‡&WVW7Bæ&öG’ÂfÇ6R“²Ò6F6‚†W'&÷"’²&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢W'&÷"æÖW76vRÒ“²ĞĞ¢6öç7BGWÆ–6FW2Ò–ç7V7D6×–väGWÆ–6FW2‡&WVW7Bæ&öG’ÂVF–Væ6Rç&WVW7FVB’æf–ÇFW"‚†—FVÒ’Óâ—FVÒæ—4GWÆ–6FR“°Ğ¢&W7öç6Ræ§6öâ‡²F÷FÃ¢VF–Væ6Rç&WVW7FVBæÆVæwF‚ÂÖçVÄ6÷VçC¢VF–Væ6RæÖçVÄ6÷VçBÂGWÆ–6FT6÷VçC¢GWÆ–6FW2æÆVæwF‚ÂGWÆ–6FW3¢GWÆ–6FW2ç6Æ–6RƒÂ’ÂGWÆ–6FT†—7F÷'“¢$Î¸¶6‚>ºÒ<Z’Ikº626òVÖ–Â²Fœ:§RI¸²<:2Ìkº7B~ºÖ’Ş¹¶’Ikº626ò>ª2î¹–’GVær6‡^ª–âŒ;6â"Ò“°Ğ§Ò“°Ğ Ğ¦ç÷7B‚"ö’ö6×–vç2÷6VæB"Â7–æ2‡&WVW7BÂ&W7öç6R’Óâ°Ğ¢6öç7B7V&¦V7BÒ6ÆVå7V&¦V7B‡&WVW7Bæ&öG’ç7V&¦V7B’ÂÆ–åFW‡BÒ6×–våÆ–åFW‡B‡&WVW7Bæ&öG’“°Ğ¢6öç7B‡FÖÄ&öG’Ò7G&–ær‡&WVW7Bæ&öG’æ‡FÖÄ&öG’óò&WVW7Bæ&öG’æ‡FÖÅ&Wf–Wróò""’çG&–Ò‚’ç6Æ–6RƒÂSó“°Ğ¢–b‚7V&¦V7BÇÂ‚Æ–åFW‡Bbb‡FÖÄ&öG’’’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$>ªvâ<;2Fœ:§RI¸l:î¹–’GVær…DÔÂâ"Ò“°Ğ¢–b†FF&6Ræ6×–vç2ç6öÖR‚†6×–vâ’Óâ²''Vææ–ær"Â'W6VB%Òæ–æ6ÇVFW2†6×–vâç7FGW2’’’&WGW&â&W7öç6Rç7FGW2ƒC’’æ§6öâ‡²W'&÷#¢,Iær<;2Ş¹—B6†«öâN¸¶6‚6Œk†ü:âNªWBâŒ:7’W6Rõ&W7VÖR†ş«v26¹Ò6†«öâN¸¶6‚I;2~ºÖ’†öærâ"Ò“°Ğ¢ÆWBVF–Væ6S°Ğ¢G'’²VF–Væ6RÒ6×–vå&WVW7FVE&V6—–VçG2‡&WVW7Bæ&öG’ÂG'VR“²Ò6F6‚†W'&÷"’²&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢W'&÷"æÖW76vRÒ“²ĞĞ¢6öç7B²&WVW7FVBÂ6VÆV7FVDw&÷W2ÒÒVF–Væ6S°Ğ¢–b‚&WVW7FVBæÆVæwF‚’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6Œk6¸ÖâI¹–’†ş«v2æŒ;6ÒVÖ–Ââ"Ò“°Ğ¢6öç7B6öÆÆV7F–öåW&ÂÒ6fTFW7F–æF–öâ†6ÆVåFW‡B‡&WVW7Bæ&öG’æ6öÆÆV7F–öåW&Â’’ÇÂ"#°Ğ¢–b†6ÆVåFW‡B‡&WVW7Bæ&öG’æ6öÆÆV7F–öåW&Â’bb6öÆÆV7F–öåW&Â’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6öÆÆV7F–öâU$Â>ªvâÌ:Æœ:¦â¾«÷B‡GGö‡GG2º7Î¸râ"Ò“°Ğ¢–b‚÷·µÇ2¦6öÆÆV7F–öå÷W&ÅÇ2§×Òö’çFW7B†G·Æ–åFW‡GÕÆâG¶‡FÖÄ&öG—Ö’bb6öÆÆV7F–öåW&Â’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$î¹–’GVærIær<;2·¶6öÆÆV7F–öå÷W&Ç×ÒæŒkær6Œk6¸ÖâöL:â6öÆÆV7F–öâU$Ââ"Ò“°Ğ¢6öç7BGWÆ–6FT6†V6·2Ò–ç7V7D6×–väGWÆ–6FW2‡&WVW7Bæ&öG’Â&WVW7FVB“°Ğ¢6öç7BGWÆ–6FW4'”VÖ–ÂÒæWrÖ†GWÆ–6FT6†V6·2æf–ÇFW"‚†—FVÒ’Óâ—FVÒæ—4GWÆ–6FR’æÖ‚†—FVÒ’Óâ¶—FVÒæVÖ–ÂçFôÆ÷vW$66R‚’Â—FVÕÒ’“°Ğ¢6fTFF&6R‚“°Ğ¢w&—FUFVÔf–ÆW2‚“°Ğ¢G'’²6öç7BG&ç7÷'FW"ÒvWEG&ç7÷'FW"‚“²v—BG&ç7÷'FW"çfW&–g’‚“²Ò6F6‚†W'&÷"’²&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢4ÕE6Œk>«Vâ<:æs¢G¶W'&÷"æÖW76vWÖÒ“²ĞĞ¢6öç7Bf–ævW'&–çBÒ6öçFVçDf–ævW'&–çB‡7V&¦V7BÂÆ–åFW‡B“°Ğ¢6öç7B6VVä–ä7–6ÆRÒæWr6WB‚“°Ğ¢6öç7B&V6—–VçG2Ò&WVW7FVBæÖ‚‡&V6—–VçB’Óâ°Ğ¢6öç7B&6RÒ²&V6—–VçD–C¢&V6—–VçBæ–BÂVÖ–Ã¢&V6—–VçBæVÖ–ÂÂæÖS¢&V6—–VçBææÖRÂw&÷W¢&V6—–VçBæw&÷WÂFö¶Vã¢æWt–B‚&Ö–Â"’Â7FGW3¢'VWVVB"Â6VçDC¢çVÆÂÂW'&÷#¢çVÆÂÓ°Ğ¢–b‡6VVä–ä7–6ÆRæ†2‡&V6—–VçBæVÖ–Â’’&WGW&â²ââæ&6RÂ7FGW3¢&&Æö6¶VB"Â&Æö6¶VE&V6öã¢%G,;–ærVÖ–ÂG&öærl;&ær~ºÖ’†¸vâNª’"Ó°Ğ¢6VVä–ä7–6ÆRæFB‡&V6—–VçBæVÖ–Â“°Ğ¢6öç7B†—7F÷'”GWÆ–6FRÒGWÆ–6FW4'”VÖ–ÂævWB‡&V6—–VçBæVÖ–ÂçFôÆ÷vW$66R‚’“°Ğ¢–b††—7F÷'”GWÆ–6FRbb&WVW7Bæ&öG’æÆÆ÷tGWÆ–6FW2ÓÒG'VR’°Ğ¢6öç7B&V6öç2Ò¶†—7F÷'”GWÆ–6FRç6ÖU7V&¦V7Bbb,I:2æªÖâ<;–ærFœ:§RI¸"Â†—7F÷'”GWÆ–6FRç6ÖT6öçFVçBbb,I:2æªÖâ<;–ærî¹–’GVær%Òæf–ÇFW"„&ööÆVâ’æ¦ö–â‚"l:"“°Ğ¢&WGW&â²ââæ&6RÂ7FGW3¢&&Æö6¶VB"Â&Æö6¶VE&V6öã¢6VçEö†—7F÷'’æ§6öã¢G·&V6öç2ÇÂ'G,;–ærÎ¸¶6‚>ºÒ'ÖÓ°Ğ¢ĞĞ¢–b†—5&V6VçFÇ•6VçE6ÖT6öçFVçB‡&V6—–VçBæVÖ–ÂÂf–ævW'&–çB’bb&WVW7Bæ&öG’æÆÆ÷tGWÆ–6FW2ÓÒG'VR’&WGW&â²ââæ&6RÂ7FGW3¢&&Æö6¶VB"Â&Æö6¶VE&V6öã¢,I:2æªÖâ<;–ærî¹–’GVærG&öær2æ|:’~ªvâæªWB"Ó°Ğ¢&WGW&â&6S°Ğ¢Ò“°Ğ¢6öç7B6×–vâÒ°Ğ¢–C¢æWt–B‚&6×–vâ"’Â7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’Â7V&¦V7BÂÆ–åFW‡BÂ‡FÖÄ&öG’Â6öçFVçD†6ƒ¢f–ævW'&–çBÀĞ¢w&÷W¢6VÆV7FVDw&÷W5³ÒÇÂ$Fæ‚<:6‚æª×F’"Â6öÆÆV7F–öåW&ÂÂgVææVÃ¢6ÆVåFW‡B‡&WVW7Bæ&öG’ægVææVÂ’ÂG—S¢6ÆVåFW‡B‡&WVW7Bæ&öG’çG—R’ÀĞ¢WFÔ6×–vã¢6ÆVåFW‡B‡&WVW7Bæ&öG’çWFÔ6×–vâ’ÇÂVÖ–ÅòG´FFRææ÷r‚—ÖÂG&6¶W$&6UW&Ã¢vWEV&Æ–4&6UW&Â‡&WVW7B’ÂFDw&VWF–æs¢&WVW7Bæ&öG’æFDw&VWF–ærÓÒfÇ6RÂ&V6—–VçG2Â7FGW3¢''Vææ–ær"ÂæW‡E6VæDC¢çVÆÂÂ6ö×ÆWFVDC¢çVÆÂÀĞ¢Ó°Ğ¢f–æ—6„6×–vä–dFöæR†6×–vâ“°Ğ¢FF&6Ræ6×–vç2çVç6†–gB†6×–vâ“²6fTFF&6R‚“°Ğ¢–b†6×–vâç7FGW2ÓÓÒ''Vææ–ær"’66†VGVÆUv÷&¶W"ƒ“°Ğ¢6öç7B7VÖÖ'’Ò6×–vå7VÖÖ'’†6×–vâ“°Ğ¢&W7öç6Rç7FGW2ƒ#"’æ§6öâ‡²6×–vã¢7VÖÖ'’ÂGWÆ–6FT&Æö6¶VC¢7VÖÖ'’æ&Æö6¶VBÂÖW76vS¢7VÖÖ'’æ&Æö6¶VBòG·7VÖÖ'’æ&Æö6¶VGÒVÖ–ÂI:2.¸²6«vâl:ÂG,;–ærî¹–’GVærG&öær2æ|:’†ş«v2G,;–ærl;&ær~ºÖ’æ¢$6†«öâN¸¶6‚I:2l:òŒ:ærIº6’~ºÖ’â"Ò“°Ğ§Ò“°Ğ¦ç÷7B‚"ö’ö6×–vç2ó¦–B÷W6R"Â‡&WVW7BÂ&W7öç6R’Óâ°Ğ¢6öç7B6×–vâÒFF&6Ræ6×–vç2æf–æB‚†—FVÒ’Óâ—FVÒæ–BÓÓÒ&WVW7Bç&×2æ–B“°Ğ¢–b‚6×–vâÇÂ6×–vâç7FGW2ÓÒ''Vææ–ær"’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6¸’<;2F¸2W6R6†«öâN¸¶6‚Iær~ºÖ’â"Ò“°Ğ¢6×–vâç7FGW2Ò'W6VB#²6×–vâææW‡E6VæDBÒçVÆÃ²6fTFF&6R‚“²6ÆV%v÷&¶W%F–ÖW"‚“°Ğ¢&W7öç6Ræ§6öâ‡²6×–vã¢6×–vå7VÖÖ'’†6×–vâ’Ò“°Ğ§Ò“°Ğ¦ç÷7B‚"ö’ö6×–vç2ó¦–B÷&W7VÖR"Â‡&WVW7BÂ&W7öç6R’Óâ°Ğ¢6öç7B6×–vâÒFF&6Ræ6×–vç2æf–æB‚†—FVÒ’Óâ—FVÒæ–BÓÓÒ&WVW7Bç&×2æ–B“°Ğ¢–b‚6×–vâÇÂ6×–vâç7FGW2ÓÒ'W6VB"’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢$6¸’<;2F¸2F«÷NºV26†«öâN¸¶6‚IærW6Râ"Ò“°Ğ¢–b‚6×–vâç&V6—–VçG2ç6öÖR‚‡&V6—–VçB’Óâ&V6—–VçBç7FGW2ÓÓÒ'VWVVB"’’²f–æ—6„6×–vä–dFöæR†6×–vâ“²6fTFF&6R‚“²&WGW&â&W7öç6Ræ§6öâ‡²6×–vã¢6×–vå7VÖÖ'’†6×–vâ’Ò“²ĞĞ¢6×–vâç7FGW2Ò''Vææ–ær#²6×–vâææW‡E6VæDBÒçVÆÃ²6fTFF&6R‚“²66†VGVÆUv÷&¶W"ƒ“°Ğ¢&W7öç6Ræ§6öâ‡²6×–vã¢6×–vå7VÖÖ'’†6×–vâ’Ò“°Ğ§Ò“°Ğ Ğ¦ævWB‚"ö’öF6†&ö&B"Â…÷&WVW7BÂ&W7öç6R’Óâ°Ğ¢6öç7B6×–vç2ÒFF&6Ræ6×–vç2æÖ†6×–vå7VÖÖ'’“°Ğ¢6öç7B&÷w2ÒFF&6Ræ6×–vç2æfÆDÖ‚†6×–vâ’Óâ6×–vâç&V6—–VçG2æÖ‚‡&V6—–VçB’Óâ°Ğ¢6öç7BWfVçG2ÒFF&6RæWfVçG2æf–ÇFW"‚†WfVçB’ÓâWfVçBçFö¶VâÓÓÒ&V6—–VçBçFö¶Vâ’Â†2Ò‡G—R’ÓâWfVçG2ç6öÖR‚†WfVçB’ÓâWfVçBçG—RÓÓÒG—R“°Ğ¢6öç7B7FGW2Ò&V6—–VçBç7FGW2ÓÓÒ&&Æö6¶VB"ò,I:26«vâG,;–ær"¢&V6—–VçBç7FGW2ÓÓÒ'VWVVB"ò,Iær6¹Ò~ºÖ’"¢&V6—–VçBç7FGW2ÓÓÒ'6VæF–ær"ò,Iær~ºÖ’"¢&V6—–VçBç7FGW2ÓÓÒ&f–ÆVB"ò$~ºÖ’Î¹v’"¢†2‚'W&6†6R"’ò,I:2×VŒ:ær"¢†2‚&&Vv–åö6†V6¶÷WB"’ò,I:26†V6¶÷WB"¢†2‚&FE÷Fõö6'B"’ò,I:2FŒ:¦Òv¸ò"¢†2‚'f–WuöÆ–æ²"’ò,I:2†VÒÆ–æ²"¢†2‚&6Æ–6²"’ò,I:2.ªVÒÆ–æ²"¢&V6—–VçBç7FGW2ÓÓÒ'6VçB"ò,I:2~ºÖ’"¢$6Œk<;2LkjærL:2#°Ğ¢&WGW&â²6×–vä–C¢6×–vâæ–BÂ6×–vå7V&¦V7C¢6×–vâç7V&¦V7BÂVÖ–Ã¢&V6—–VçBæVÖ–ÂÂæÖS¢&V6—–VçBææÖRÂw&÷W¢&V6—–VçBæw&÷WÂ6VçDC¢&V6—–VçBç6VçDBÂ7FGW2Â&Æö6¶VE&V6öã¢&V6—–VçBæ&Æö6¶VE&V6öâÇÂ""ÂWfVçG3¢WfVçG2æÖ‚†WfVçB’Óâ‡²ââæWfVçBÂÆ&VÃ¢WfVçDÆ&VÂ†WfVçBçG—R’Ò’’Ó°Ğ¢Ò’“°Ğ¢&W7öç6Ræ§6öâ‡²6×–vç2Â&÷w2Ò“°Ğ§Ò“°Ğ¦ævWB‚"÷"ó§Fö¶Vâ"Â‡&WVW7BÂ&W7öç6R’Óâ°Ğ¢6öç7B6×–vâÒFF&6Ræ6×–vç2æf–æB‚†—FVÒ’Óâ—FVÒç&V6—–VçG2ç6öÖR‚‡&V6—–VçB’Óâ&V6—–VçBçFö¶VâÓÓÒ&WVW7Bç&×2çFö¶Vâ’“°Ğ¢6öç7B&V6—–VçBÒ6×–vãòç&V6—–VçG2æf–æB‚†—FVÒ’Óâ—FVÒçFö¶VâÓÓÒ&WVW7Bç&×2çFö¶Vâ’ÂFW7F–æF–öâÒ6fTFW7F–æF–öâ†6ÆVåFW‡B‡&WVW7BçVW'’çW&Â’“°Ğ¢–b‚6×–vâÇÂ&V6—–VçBÇÂFW7F–æF–öâ’&WGW&â&W7öç6Rç7FGW2ƒC’ç6VæB‚$Æœ:¦â¾«÷B¶Œ;Færº7Î¸râ"“°Ğ¢FF&6RæWfVçG2çW6‚‡²–C¢æWt–B‚&WfVçB"’Â6×–vä–C¢6×–vâæ–BÂFö¶Vã¢&V6—–VçBçFö¶VâÂG—S¢&6Æ–6²"Â7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’ÂW&Ã¢FW7F–æF–öâÒ“²6fTFF&6R‚“²&W7öç6Rç&VF—&V7B†FW7F–æF–öâ“°Ğ§Ò“°Ğ¦æ÷F–öç2‚"öWfVçBó§Fö¶Vâ"Â…÷&WVW7BÂ&W7öç6R’Óâ&W7öç6Rç6WB‚$66W72Ô6öçG&öÂÔÆÆ÷rÔ÷&–v–â"Â"¢"’ç6WB‚$66W72Ô6öçG&öÂÔÆÆ÷rÔ†VFW'2"Â$6öçFVçBÕG—R"’ç6VæE7FGW2ƒ#B’“°Ğ¦ç÷7B‚"öWfVçBó§Fö¶Vâ"Â‡&WVW7BÂ&W7öç6R’Óâ°Ğ¢&W7öç6Rç6WB‚$66W72Ô6öçG&öÂÔÆÆ÷rÔ÷&–v–â"Â"¢"“°Ğ¢6öç7BÆÆ÷vVEG—W2ÒæWr6WB…²&FE÷Fõö6'B"Â&&Vv–åö6†V6¶÷WB"Â'W&6†6R"Â'f–WuöÆ–æ²%Ò’ÂG—RÒ6ÆVåFW‡B‡&WVW7Bæ&öG’æWfVçBÇÂ&WVW7BçVW'’æWfVçB“°Ğ¢6öç7B6×–vâÒFF&6Ræ6×–vç2æf–æB‚†—FVÒ’Óâ—FVÒç&V6—–VçG2ç6öÖR‚‡&V6—–VçB’Óâ&V6—–VçBçFö¶VâÓÓÒ&WVW7Bç&×2çFö¶Vâ’“°Ğ¢–b‚6×–vâÇÂÆÆ÷vVEG—W2æ†2‡G—R’’&WGW&â&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢%Fö¶Vâ†ş«v2Æşª’>»¶¸vâ¶Œ;Færº7Î¸râ"Ò“°Ğ¢FF&6RæWfVçG2çW6‚‡²–C¢æWt–B‚&WfVçB"’Â6×–vä–C¢6×–vâæ–BÂFö¶Vã¢&WVW7Bç&×2çFö¶VâÂG—RÂ7&VFVDC¢æWrFFR‚’çFô•4õ7G&–ær‚’ÂfÇVS¢çVÖ&W"‡&WVW7Bæ&öG’çfÇVRÇÂ’ÇÂVæFVf–æVBÒ“²6fTFF&6R‚“²&W7öç6Rç7FGW2ƒ#’æ§6öâ‡²ö³¢G'VRÒ“°Ğ§Ò“°Ğ¦çW6R‚†W'&÷"Â÷&WVW7BÂ&W7öç6RÂöæW‡B’Óâ²6öç6öÆRæW'&÷"†W'&÷"“²&W7öç6Rç7FGW2ƒC’æ§6öâ‡²W'&÷#¢W'&÷"æÖW76vRÇÂ%œ:§R>ªwR¶Œ;Færº7Î¸râ"Ò“²Ò“°Ğ¦–b‚6Æ÷VBæVæ&ÆVB’°Ğ¢w&—FUFVÔf–ÆW2‚“°Ğ¢æÆ—7FVâ‡÷'BÂ†÷7BÂ‚’Óâ²6öç6öÆRæÆör†æöFVÖ–ÂIær6ª’Nª’‡GG¢òó#rããã¢G·÷'GÖ“²–b†FF&6Ræ6×–vç2ç6öÖR‚†6×–vâ’Óâ6×–vâç7FGW2ÓÓÒ''Vææ–ær"’’66†VGVÆUv÷&¶W"ƒ“²Ò“°Ğ§ĞĞ¦ÖöGVÆRæW‡÷'G2Ò°Ğ¦ÖöGVÆRæW‡÷'G2çVWVT†VÇW'2Ò²vWEG&ç7÷'FW"ÂW'6öæÆ—¦RÂ6ö×÷6U&V6—–VçEFW‡BÂ&V6÷&E6VçBÂf–æ—6„6×–vä–dFöæRÂ&æFöÔFVÆ’Ó°Ğ Ğ 
