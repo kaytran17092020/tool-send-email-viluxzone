@@ -30,7 +30,9 @@ function dirty() { current().dirty = true; }
 function schedule(delayMs) { current().wake = Math.max(0, Math.ceil(delayMs / 1000)); }
 
 async function publish(delay) {
-  await queue.send(topic, { wake: crypto.randomUUID() }, { delaySeconds: delay, idempotencyKey: crypto.randomUUID() });
+  const options = { idempotencyKey: crypto.randomUUID() };
+  if (delay > 0) options.delaySeconds = delay;
+  await queue.send(topic, { wake: crypto.randomUUID() }, options);
 }
 
 function middleware(request, response, next) {
@@ -147,3 +149,4 @@ async function recordQueueProbe() {
 }
 
 module.exports = { enabled, current, dirty, schedule, middleware, deliver, queue, probe, queueProbe, recordQueueProbe };
+
